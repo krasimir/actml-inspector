@@ -1,6 +1,6 @@
 {
   "name": "actml-inspector",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "ActML inspector",
   "main": "lib/index.js",
   "scripts": {
@@ -30,6 +30,8 @@
     "babel-plugin-transform-object-rest-spread": "6.26.0",
     "babel-preset-es2015": "6.24.1",
     "babel-preset-stage-3": "6.24.1",
-    "regenerator-runtime": "0.12.1"
+    "regenerator-runtime": "0.12.1",
+    "eslint": "4.18.2",
+    "eslint-plugin-react": "7.5.1"
   }
 }

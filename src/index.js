@@ -128,7 +128,7 @@ export default {
         { element: { id: node.element.id }},
         processor.system().tree.diagnose()
       ]);
-      printSnapshotToConsole(snapshots[snapshots.length - 1], options);
+      printSnapshotToConsole(snapshots[snapshots.length - 1]);
     }
 
     // processor.onNodeIn(node => snapshot(IN, node));
