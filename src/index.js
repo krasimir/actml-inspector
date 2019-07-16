@@ -138,4 +138,4 @@ export default {
   printSnapshotToConsole(snapshots) {
     snapshots.forEach(printSnapshotToConsole);
   }
-}
+};
