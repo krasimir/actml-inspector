@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const inspector = require('../lib');
+const inspector = require('../actml-inspector.js');
 const argv = process.argv;
 const file = path.normalize(__dirname + '/../' + argv[2]);
 

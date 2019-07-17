@@ -2,11 +2,12 @@
   "name": "actml-inspector",
   "version": "0.2.1",
   "description": "ActML inspector",
-  "main": "lib/index.js",
+  "main": "./actml-inspector.js",
   "scripts": {
-    "transpile": "rm -rf ./lib/* && ./node_modules/.bin/babel ./src --out-dir ./lib",
-    "dev": "rm -rf ./lib/* && ./node_modules/.bin/babel ./src --out-dir ./lib --ignore spec.js --watch",
-    "release": "yarn transpile"
+    "release": "yarn build",
+    "test-print-to-console": "node ./cli fixtures/todomvc.json",
+    "build": "browserify ./src/index.js -o ./actml-inspector.js --standalone actmlInspector -t [ babelify --presets [ es2015 stage-3 ] --plugins [ transform-object-rest-spread ] ]",
+    "dev": "watchify ./src/index.js -o ./actml-inspector.js --standalone actmlInspector --verbose -t [ babelify --presets [ es2015 stage-3 ] --plugins [ transform-object-rest-spread ] ]"
   },
   "repository": {
     "type": "git",
@@ -32,6 +33,9 @@
     "babel-preset-stage-3": "6.24.1",
     "regenerator-runtime": "0.12.1",
     "eslint": "4.18.2",
-    "eslint-plugin-react": "7.5.1"
+    "eslint-plugin-react": "7.5.1",
+    "babelify": "8.0.0",
+    "browserify": "14.5.0",
+    "watchify": "3.9.0"
   }
 }
