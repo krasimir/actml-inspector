@@ -5,9 +5,10 @@ const OUT = 'OUT';
 const REMOVE = 'REMOVE';
 
 import { printSnapshotToConsole } from './console';
+import { render } from './ui/Renderer';
 
-export default {
-  watch(processor) {
+module.exports = {
+  watchToConsole(processor) {
     const snapshots = [];
 
     function snapshot(type, node) {
@@ -25,5 +26,6 @@ export default {
   },
   printSnapshotToConsole(snapshots) {
     snapshots.forEach(printSnapshotToConsole);
-  }
+  },
+  render
 };

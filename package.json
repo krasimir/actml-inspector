@@ -4,8 +4,8 @@
   "description": "ActML inspector",
   "main": "./actml-inspector.js",
   "scripts": {
+    "test-print-to-console": "node ./cli dev/todomvc.json",
     "release": "yarn build",
-    "test-print-to-console": "node ./cli fixtures/todomvc.json",
     "build": "browserify ./src/index.js -o ./actml-inspector.js --standalone actmlInspector -t [ babelify --presets [ es2015 stage-3 ] --plugins [ transform-object-rest-spread ] ]",
     "dev": "watchify ./src/index.js -o ./actml-inspector.js --standalone actmlInspector --verbose -t [ babelify --presets [ es2015 stage-3 ] --plugins [ transform-object-rest-spread ] ]"
   },
@@ -31,11 +31,14 @@
     "babel-plugin-transform-object-rest-spread": "6.26.0",
     "babel-preset-es2015": "6.24.1",
     "babel-preset-stage-3": "6.24.1",
-    "regenerator-runtime": "0.12.1",
-    "eslint": "4.18.2",
-    "eslint-plugin-react": "7.5.1",
     "babelify": "8.0.0",
     "browserify": "14.5.0",
+    "eslint": "4.18.2",
+    "eslint-plugin-react": "7.5.1",
+    "regenerator-runtime": "0.12.1",
     "watchify": "3.9.0"
+  },
+  "dependencies": {
+    "vis": "4.21.0"
   }
 }

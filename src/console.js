@@ -1,9 +1,9 @@
 import sanitize from './helpers/sanitize';
 
 const isRunningInNode =
-  (typeof process !== 'undefined') &&
+  ((typeof process !== 'undefined') &&
   (typeof process.release !== 'undefined') &&
-  (process.release.name === 'node');
+  (process.release.name === 'node')) || typeof window === 'undefined';
 
 const trim = (str, len, emp = '...') => str.length > len ? str.substr(0, len) + emp : str;
 const getIndMargin = ind => {
