@@ -1,4 +1,1462 @@
 (function(f){if(typeof exports==="object"&&typeof module!=="undefined"){module.exports=f()}else if(typeof define==="function"&&define.amd){define([],f)}else{var g;if(typeof window!=="undefined"){g=window}else if(typeof global!=="undefined"){g=global}else if(typeof self!=="undefined"){g=self}else{g=this}g.actmlInspector = f()}})(function(){var define,module,exports;return (function(){function r(e,n,t){function o(i,f){if(!n[i]){if(!e[i]){var c="function"==typeof require&&require;if(!f&&c)return c(i,!0);if(u)return u(i,!0);var a=new Error("Cannot find module '"+i+"'");throw a.code="MODULE_NOT_FOUND",a}var p=n[i]={exports:{}};e[i][0].call(p.exports,function(r){var n=e[i][1][r];return o(n||r)},p,p.exports,r,e,n,t)}return n[i].exports}for(var u="function"==typeof require&&require,i=0;i<t.length;i++)o(t[i]);return o}return r})()({1:[function(require,module,exports){
+/** @license MIT License (c) copyright 2010-2014 original author or authors */
+/** @author Brian Cavalier */
+/** @author John Hann */
+
+var lcs = require('./lib/lcs');
+var array = require('./lib/array');
+var patch = require('./lib/jsonPatch');
+var inverse = require('./lib/inverse');
+var jsonPointer = require('./lib/jsonPointer');
+var encodeSegment = jsonPointer.encodeSegment;
+
+exports.diff = diff;
+exports.patch = patch.apply;
+exports.patchInPlace = patch.applyInPlace;
+exports.inverse = inverse;
+exports.clone = patch.clone;
+
+// Errors
+exports.InvalidPatchOperationError = require('./lib/InvalidPatchOperationError');
+exports.TestFailedError = require('./lib/TestFailedError');
+exports.PatchNotInvertibleError = require('./lib/PatchNotInvertibleError');
+
+var isValidObject = patch.isValidObject;
+var defaultHash = patch.defaultHash;
+
+/**
+ * Compute a JSON Patch representing the differences between a and b.
+ * @param {object|array|string|number|null} a
+ * @param {object|array|string|number|null} b
+ * @param {?function|?object} options if a function, see options.hash
+ * @param {?function(x:*):String|Number} options.hash used to hash array items
+ *  in order to recognize identical objects, defaults to JSON.stringify
+ * @param {?function(index:Number, array:Array):object} options.makeContext
+ *  used to generate patch context. If not provided, context will not be generated
+ * @returns {array} JSON Patch such that patch(diff(a, b), a) ~ b
+ */
+function diff(a, b, options) {
+	return appendChanges(a, b, '', initState(options, [])).patch;
+}
+
+/**
+ * Create initial diff state from the provided options
+ * @param {?function|?object} options @see diff options above
+ * @param {array} patch an empty or existing JSON Patch array into which
+ *  the diff should generate new patch operations
+ * @returns {object} initialized diff state
+ */
+function initState(options, patch) {
+	if(typeof options === 'object') {
+		return {
+			patch: patch,
+			hash: orElse(isFunction, options.hash, defaultHash),
+			makeContext: orElse(isFunction, options.makeContext, defaultContext),
+			invertible: !(options.invertible === false)
+		};
+	} else {
+		return {
+			patch: patch,
+			hash: orElse(isFunction, options, defaultHash),
+			makeContext: defaultContext,
+			invertible: true
+		};
+	}
+}
+
+/**
+ * Given two JSON values (object, array, number, string, etc.), find their
+ * differences and append them to the diff state
+ * @param {object|array|string|number|null} a
+ * @param {object|array|string|number|null} b
+ * @param {string} path
+ * @param {object} state
+ * @returns {Object} updated diff state
+ */
+function appendChanges(a, b, path, state) {
+	if(Array.isArray(a) && Array.isArray(b)) {
+		return appendArrayChanges(a, b, path, state);
+	}
+
+	if(isValidObject(a) && isValidObject(b)) {
+		return appendObjectChanges(a, b, path, state);
+	}
+
+	return appendValueChanges(a, b, path, state);
+}
+
+/**
+ * Given two objects, find their differences and append them to the diff state
+ * @param {object} o1
+ * @param {object} o2
+ * @param {string} path
+ * @param {object} state
+ * @returns {Object} updated diff state
+ */
+function appendObjectChanges(o1, o2, path, state) {
+	var keys = Object.keys(o2);
+	var patch = state.patch;
+	var i, key;
+
+	for(i=keys.length-1; i>=0; --i) {
+		key = keys[i];
+		var keyPath = path + '/' + encodeSegment(key);
+		if(o1[key] !== void 0) {
+			appendChanges(o1[key], o2[key], keyPath, state);
+		} else {
+			patch.push({ op: 'add', path: keyPath, value: o2[key] });
+		}
+	}
+
+	keys = Object.keys(o1);
+	for(i=keys.length-1; i>=0; --i) {
+		key = keys[i];
+		if(o2[key] === void 0) {
+			var p = path + '/' + encodeSegment(key);
+			if(state.invertible) {
+				patch.push({ op: 'test', path: p, value: o1[key] });
+			}
+			patch.push({ op: 'remove', path: p });
+		}
+	}
+
+	return state;
+}
+
+/**
+ * Given two arrays, find their differences and append them to the diff state
+ * @param {array} a1
+ * @param {array} a2
+ * @param {string} path
+ * @param {object} state
+ * @returns {Object} updated diff state
+ */
+function appendArrayChanges(a1, a2, path, state) {
+	var a1hash = array.map(state.hash, a1);
+	var a2hash = array.map(state.hash, a2);
+
+	var lcsMatrix = lcs.compare(a1hash, a2hash);
+
+	return lcsToJsonPatch(a1, a2, path, state, lcsMatrix);
+}
+
+/**
+ * Transform an lcsMatrix into JSON Patch operations and append
+ * them to state.patch, recursing into array elements as necessary
+ * @param {array} a1
+ * @param {array} a2
+ * @param {string} path
+ * @param {object} state
+ * @param {object} lcsMatrix
+ * @returns {object} new state with JSON Patch operations added based
+ *  on the provided lcsMatrix
+ */
+function lcsToJsonPatch(a1, a2, path, state, lcsMatrix) {
+	var offset = 0;
+	return lcs.reduce(function(state, op, i, j) {
+		var last, context;
+		var patch = state.patch;
+		var p = path + '/' + (j + offset);
+
+		if (op === lcs.REMOVE) {
+			// Coalesce adjacent remove + add into replace
+			last = patch[patch.length-1];
+			context = state.makeContext(j, a1);
+
+			if(state.invertible) {
+				patch.push({ op: 'test', path: p, value: a1[j], context: context });
+			}
+
+			if(last !== void 0 && last.op === 'add' && last.path === p) {
+				last.op = 'replace';
+				last.context = context;
+			} else {
+				patch.push({ op: 'remove', path: p, context: context });
+			}
+
+			offset -= 1;
+
+		} else if (op === lcs.ADD) {
+			// See https://tools.ietf.org/html/rfc6902#section-4.1
+			// May use either index===length *or* '-' to indicate appending to array
+			patch.push({ op: 'add', path: p, value: a2[i],
+				context: state.makeContext(j, a1)
+			});
+
+			offset += 1;
+
+		} else {
+			appendChanges(a1[j], a2[i], p, state);
+		}
+
+		return state;
+
+	}, state, lcsMatrix);
+}
+
+/**
+ * Given two number|string|null values, if they differ, append to diff state
+ * @param {string|number|null} a
+ * @param {string|number|null} b
+ * @param {string} path
+ * @param {object} state
+ * @returns {object} updated diff state
+ */
+function appendValueChanges(a, b, path, state) {
+	if(a !== b) {
+		if(state.invertible) {
+			state.patch.push({ op: 'test', path: path, value: a });
+		}
+
+		state.patch.push({ op: 'replace', path: path, value: b });
+	}
+
+	return state;
+}
+
+/**
+ * @param {function} predicate
+ * @param {*} x
+ * @param {*} y
+ * @returns {*} x if predicate(x) is truthy, otherwise y
+ */
+function orElse(predicate, x, y) {
+	return predicate(x) ? x : y;
+}
+
+/**
+ * Default patch context generator
+ * @returns {undefined} undefined context
+ */
+function defaultContext() {
+	return void 0;
+}
+
+/**
+ * @param {*} x
+ * @returns {boolean} true if x is a function, false otherwise
+ */
+function isFunction(x) {
+	return typeof x === 'function';
+}
+
+},{"./lib/InvalidPatchOperationError":2,"./lib/PatchNotInvertibleError":3,"./lib/TestFailedError":4,"./lib/array":5,"./lib/inverse":9,"./lib/jsonPatch":10,"./lib/jsonPointer":11,"./lib/lcs":13}],2:[function(require,module,exports){
+module.exports = InvalidPatchOperationError;
+
+function InvalidPatchOperationError(message) {
+	Error.call(this);
+	this.name = this.constructor.name;
+	this.message = message;
+	if(typeof Error.captureStackTrace === 'function') {
+		Error.captureStackTrace(this, this.constructor);
+	}
+}
+
+InvalidPatchOperationError.prototype = Object.create(Error.prototype);
+InvalidPatchOperationError.prototype.constructor = InvalidPatchOperationError;
+},{}],3:[function(require,module,exports){
+module.exports = PatchNotInvertibleError;
+
+function PatchNotInvertibleError(message) {
+	Error.call(this);
+	this.name = this.constructor.name;
+	this.message = message;
+	if(typeof Error.captureStackTrace === 'function') {
+		Error.captureStackTrace(this, this.constructor);
+	}
+}
+
+PatchNotInvertibleError.prototype = Object.create(Error.prototype);
+PatchNotInvertibleError.prototype.constructor = PatchNotInvertibleError;
+},{}],4:[function(require,module,exports){
+module.exports = TestFailedError;
+
+function TestFailedError(message) {
+	Error.call(this);
+	this.name = this.constructor.name;
+	this.message = message;
+	if(typeof Error.captureStackTrace === 'function') {
+		Error.captureStackTrace(this, this.constructor);
+	}
+}
+
+TestFailedError.prototype = Object.create(Error.prototype);
+TestFailedError.prototype.constructor = TestFailedError;
+},{}],5:[function(require,module,exports){
+/** @license MIT License (c) copyright 2010-2014 original author or authors */
+/** @author Brian Cavalier */
+/** @author John Hann */
+
+exports.cons = cons;
+exports.tail = tail;
+exports.map = map;
+
+/**
+ * Prepend x to a, without mutating a. Faster than a.unshift(x)
+ * @param {*} x
+ * @param {Array} a array-like
+ * @returns {Array} new Array with x prepended
+ */
+function cons(x, a) {
+	var l = a.length;
+	var b = new Array(l+1);
+	b[0] = x;
+	for(var i=0; i<l; ++i) {
+		b[i+1] = a[i];
+	}
+
+	return b;
+}
+
+/**
+ * Create a new Array containing all elements in a, except the first.
+ *  Faster than a.slice(1)
+ * @param {Array} a array-like
+ * @returns {Array} new Array, the equivalent of a.slice(1)
+ */
+function tail(a) {
+	var l = a.length-1;
+	var b = new Array(l);
+	for(var i=0; i<l; ++i) {
+		b[i] = a[i+1];
+	}
+
+	return b;
+}
+
+/**
+ * Map any array-like. Faster than Array.prototype.map
+ * @param {function} f
+ * @param {Array} a array-like
+ * @returns {Array} new Array mapped by f
+ */
+function map(f, a) {
+	var b = new Array(a.length);
+	for(var i=0; i< a.length; ++i) {
+		b[i] = f(a[i]);
+	}
+	return b;
+}
+},{}],6:[function(require,module,exports){
+/** @license MIT License (c) copyright 2010-2014 original author or authors */
+/** @author Brian Cavalier */
+/** @author John Hann */
+
+/**
+ * Create a deep copy of x which must be a legal JSON object/array/value
+ * @param {object|array|string|number|null} x object/array/value to clone
+ * @returns {object|array|string|number|null} clone of x
+ */
+module.exports = clone;
+
+function clone(x) {
+	if(x == null || typeof x !== 'object') {
+		return x;
+	}
+
+	if(Array.isArray(x)) {
+		return cloneArray(x);
+	}
+
+	return cloneObject(x);
+}
+
+function cloneArray (x) {
+	var l = x.length;
+	var y = new Array(l);
+
+	for (var i = 0; i < l; ++i) {
+		y[i] = clone(x[i]);
+	}
+
+	return y;
+}
+
+function cloneObject (x) {
+	var keys = Object.keys(x);
+	var y = {};
+
+	for (var k, i = 0, l = keys.length; i < l; ++i) {
+		k = keys[i];
+		y[k] = clone(x[k]);
+	}
+
+	return y;
+}
+
+},{}],7:[function(require,module,exports){
+var jsonPointer = require('./jsonPointer');
+
+/**
+ * commute the patch sequence a,b to b,a
+ * @param {object} a patch operation
+ * @param {object} b patch operation
+ */
+module.exports = function commutePaths(a, b) {
+	// TODO: cases for special paths: '' and '/'
+	var left = jsonPointer.parse(a.path);
+	var right = jsonPointer.parse(b.path);
+	var prefix = getCommonPathPrefix(left, right);
+	var isArray = isArrayPath(left, right, prefix.length);
+
+	// Never mutate the originals
+	var ac = copyPatch(a);
+	var bc = copyPatch(b);
+
+	if(prefix.length === 0 && !isArray) {
+		// Paths share no common ancestor, simple swap
+		return [bc, ac];
+	}
+
+	if(isArray) {
+		return commuteArrayPaths(ac, left, bc, right);
+	} else {
+		return commuteTreePaths(ac, left, bc, right);
+	}
+};
+
+function commuteTreePaths(a, left, b, right) {
+	if(a.path === b.path) {
+		throw new TypeError('cannot commute ' + a.op + ',' + b.op + ' with identical object paths');
+	}
+	// FIXME: Implement tree path commutation
+	return [b, a];
+}
+
+/**
+ * Commute two patches whose common ancestor (which may be the immediate parent)
+ * is an array
+ * @param a
+ * @param left
+ * @param b
+ * @param right
+ * @returns {*}
+ */
+function commuteArrayPaths(a, left, b, right) {
+	if(left.length === right.length) {
+		return commuteArraySiblings(a, left, b, right);
+	}
+
+	if (left.length > right.length) {
+		// left is longer, commute by "moving" it to the right
+		left = commuteArrayAncestor(b, right, a, left, -1);
+		a.path = jsonPointer.absolute(jsonPointer.join(left));
+	} else {
+		// right is longer, commute by "moving" it to the left
+		right = commuteArrayAncestor(a, left, b, right, 1);
+		b.path = jsonPointer.absolute(jsonPointer.join(right));
+	}
+
+	return [b, a];
+}
+
+function isArrayPath(left, right, index) {
+	return jsonPointer.isValidArrayIndex(left[index])
+		&& jsonPointer.isValidArrayIndex(right[index]);
+}
+
+/**
+ * Commute two patches referring to items in the same array
+ * @param l
+ * @param lpath
+ * @param r
+ * @param rpath
+ * @returns {*[]}
+ */
+function commuteArraySiblings(l, lpath, r, rpath) {
+
+	var target = lpath.length-1;
+	var lindex = +lpath[target];
+	var rindex = +rpath[target];
+
+	var commuted;
+
+	if(lindex < rindex) {
+		// Adjust right path
+		if(l.op === 'add' || l.op === 'copy') {
+			commuted = rpath.slice();
+			commuted[target] = Math.max(0, rindex - 1);
+			r.path = jsonPointer.absolute(jsonPointer.join(commuted));
+		} else if(l.op === 'remove') {
+			commuted = rpath.slice();
+			commuted[target] = rindex + 1;
+			r.path = jsonPointer.absolute(jsonPointer.join(commuted));
+		}
+	} else if(r.op === 'add' || r.op === 'copy') {
+		// Adjust left path
+		commuted = lpath.slice();
+		commuted[target] = lindex + 1;
+		l.path = jsonPointer.absolute(jsonPointer.join(commuted));
+	} else if (lindex > rindex && r.op === 'remove') {
+		// Adjust left path only if remove was at a (strictly) lower index
+		commuted = lpath.slice();
+		commuted[target] = Math.max(0, lindex - 1);
+		l.path = jsonPointer.absolute(jsonPointer.join(commuted));
+	}
+
+	return [r, l];
+}
+
+/**
+ * Commute two patches with a common array ancestor
+ * @param l
+ * @param lpath
+ * @param r
+ * @param rpath
+ * @param direction
+ * @returns {*}
+ */
+function commuteArrayAncestor(l, lpath, r, rpath, direction) {
+	// rpath is longer or same length
+
+	var target = lpath.length-1;
+	var lindex = +lpath[target];
+	var rindex = +rpath[target];
+
+	// Copy rpath, then adjust its array index
+	var rc = rpath.slice();
+
+	if(lindex > rindex) {
+		return rc;
+	}
+
+	if(l.op === 'add' || l.op === 'copy') {
+		rc[target] = Math.max(0, rindex - direction);
+	} else if(l.op === 'remove') {
+		rc[target] = Math.max(0, rindex + direction);
+	}
+
+	return rc;
+}
+
+function getCommonPathPrefix(p1, p2) {
+	var p1l = p1.length;
+	var p2l = p2.length;
+	if(p1l === 0 || p2l === 0 || (p1l < 2 && p2l < 2)) {
+		return [];
+	}
+
+	// If paths are same length, the last segment cannot be part
+	// of a common prefix.  If not the same length, the prefix cannot
+	// be longer than the shorter path.
+	var l = p1l === p2l
+		? p1l - 1
+		: Math.min(p1l, p2l);
+
+	var i = 0;
+	while(i < l && p1[i] === p2[i]) {
+		++i
+	}
+
+	return p1.slice(0, i);
+}
+
+function copyPatch(p) {
+	if(p.op === 'remove') {
+		return { op: p.op, path: p.path };
+	}
+
+	if(p.op === 'copy' || p.op === 'move') {
+		return { op: p.op, path: p.path, from: p.from };
+	}
+
+	// test, add, replace
+	return { op: p.op, path: p.path, value: p.value };
+}
+},{"./jsonPointer":11}],8:[function(require,module,exports){
+module.exports = deepEquals;
+
+/**
+ * Compare 2 JSON values, or recursively compare 2 JSON objects or arrays
+ * @param {object|array|string|number|boolean|null} a
+ * @param {object|array|string|number|boolean|null} b
+ * @returns {boolean} true iff a and b are recursively equal
+ */
+function deepEquals(a, b) {
+	if(a === b) {
+		return true;
+	}
+
+	if(Array.isArray(a) && Array.isArray(b)) {
+		return compareArrays(a, b);
+	}
+
+	if(typeof a === 'object' && typeof b === 'object') {
+		return compareObjects(a, b);
+	}
+
+	return false;
+}
+
+function compareArrays(a, b) {
+	if(a.length !== b.length) {
+		return false;
+	}
+
+	for(var i = 0; i<a.length; ++i) {
+		if(!deepEquals(a[i], b[i])) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
+function compareObjects(a, b) {
+	if((a === null && b !== null) || (a !== null && b === null)) {
+		return false;
+	}
+
+	var akeys = Object.keys(a);
+	var bkeys = Object.keys(b);
+
+	if(akeys.length !== bkeys.length) {
+		return false;
+	}
+
+	for(var i = 0, k; i<akeys.length; ++i) {
+		k = akeys[i];
+		if(!(k in b && deepEquals(a[k], b[k]))) {
+			return false;
+		}
+	}
+
+	return true;
+}
+},{}],9:[function(require,module,exports){
+var patches = require('./patches');
+
+module.exports = function inverse(p) {
+	var pr = [];
+	var i, skip;
+	for(i = p.length-1; i>= 0; i -= skip) {
+		skip = invertOp(pr, p[i], i, p);
+	}
+
+	return pr;
+};
+
+function invertOp(patch, c, i, context) {
+	var op = patches[c.op];
+	return op !== void 0 && typeof op.inverse === 'function'
+		? op.inverse(patch, c, i, context)
+		: 1;
+}
+
+},{"./patches":14}],10:[function(require,module,exports){
+/** @license MIT License (c) copyright 2010-2014 original author or authors */
+/** @author Brian Cavalier */
+/** @author John Hann */
+
+var patches = require('./patches');
+var clone = require('./clone');
+var InvalidPatchOperationError = require('./InvalidPatchOperationError');
+
+exports.apply = patch;
+exports.applyInPlace = patchInPlace;
+exports.clone = clone;
+exports.isValidObject = isValidObject;
+exports.defaultHash = defaultHash;
+
+var defaultOptions = {};
+
+/**
+ * Apply the supplied JSON Patch to x
+ * @param {array} changes JSON Patch
+ * @param {object|array|string|number} x object/array/value to patch
+ * @param {object} options
+ * @param {function(index:Number, array:Array, context:object):Number} options.findContext
+ *  function used adjust array indexes for smarty/fuzzy patching, for
+ *  patches containing context
+ * @returns {object|array|string|number} patched version of x. If x is
+ *  an array or object, it will be mutated and returned. Otherwise, if
+ *  x is a value, the new value will be returned.
+ */
+function patch(changes, x, options) {
+	return patchInPlace(changes, clone(x), options);
+}
+
+function patchInPlace(changes, x, options) {
+	if(!options) {
+		options = defaultOptions;
+	}
+
+	// TODO: Consider throwing if changes is not an array
+	if(!Array.isArray(changes)) {
+		return x;
+	}
+
+	var patch, p;
+	for(var i=0; i<changes.length; ++i) {
+		p = changes[i];
+		patch = patches[p.op];
+
+		if(patch === void 0) {
+			throw new InvalidPatchOperationError('invalid op ' + JSON.stringify(p));
+		}
+
+		x = patch.apply(x, p, options);
+	}
+
+	return x;
+}
+
+function defaultHash(x) {
+	return isValidObject(x) || isArray(x) ? JSON.stringify(x) : x;
+}
+
+function isValidObject (x) {
+	return x !== null && Object.prototype.toString.call(x) === '[object Object]';
+}
+
+function isArray (x) {
+	return Object.prototype.toString.call(x) === '[object Array]';
+}
+
+},{"./InvalidPatchOperationError":2,"./clone":6,"./patches":14}],11:[function(require,module,exports){
+/** @license MIT License (c) copyright 2010-2014 original author or authors */
+/** @author Brian Cavalier */
+/** @author John Hann */
+
+var _parse = require('./jsonPointerParse');
+
+exports.find = find;
+exports.join = join;
+exports.absolute = absolute;
+exports.parse = parse;
+exports.contains = contains;
+exports.encodeSegment = encodeSegment;
+exports.decodeSegment = decodeSegment;
+exports.parseArrayIndex = parseArrayIndex;
+exports.isValidArrayIndex = isValidArrayIndex;
+
+// http://tools.ietf.org/html/rfc6901#page-2
+var separator = '/';
+var separatorRx = /\//g;
+var encodedSeparator = '~1';
+var encodedSeparatorRx = /~1/g;
+
+var escapeChar = '~';
+var escapeRx = /~/g;
+var encodedEscape = '~0';
+var encodedEscapeRx = /~0/g;
+
+/**
+ * Find the parent of the specified path in x and return a descriptor
+ * containing the parent and a key.  If the parent does not exist in x,
+ * return undefined, instead.
+ * @param {object|array} x object or array in which to search
+ * @param {string} path JSON Pointer string (encoded)
+ * @param {?function(index:Number, array:Array, context:object):Number} findContext
+ *  optional function used adjust array indexes for smarty/fuzzy patching, for
+ *  patches containing context.  If provided, context MUST also be provided.
+ * @param {?{before:Array, after:Array}} context optional patch context for
+ *  findContext to use to adjust array indices.  If provided, findContext MUST
+ *  also be provided.
+ * @returns {{target:object|array|number|string, key:string}|undefined}
+ */
+function find(x, path, findContext, context) {
+	if(typeof path !== 'string') {
+		return;
+	}
+
+	if(path === '') {
+		// whole document
+		return { target: x, key: void 0 };
+	}
+
+	if(path === separator) {
+		return { target: x, key: '' };
+	}
+
+	var parent = x, key;
+	var hasContext = context !== void 0;
+
+	_parse(path, function(segment) {
+		// hm... this seems like it should be if(typeof x === 'undefined')
+		if(x == null) {
+			// Signal that we prematurely hit the end of the path hierarchy.
+			parent = null;
+			return false;
+		}
+
+		if(Array.isArray(x)) {
+			key = hasContext
+				? findIndex(findContext, parseArrayIndex(segment), x, context)
+				: segment === '-' ? segment : parseArrayIndex(segment);
+		} else {
+			key = segment;
+		}
+
+		parent = x;
+		x = x[key];
+	});
+
+	return parent === null
+		? void 0
+		: { target: parent, key: key };
+}
+
+function absolute(path) {
+	return path[0] === separator ? path : separator + path;
+}
+
+function join(segments) {
+	return segments.join(separator);
+}
+
+function parse(path) {
+	var segments = [];
+	_parse(path, segments.push.bind(segments));
+	return segments;
+}
+
+function contains(a, b) {
+	return b.indexOf(a) === 0 && b[a.length] === separator;
+}
+
+/**
+ * Decode a JSON Pointer path segment
+ * @see http://tools.ietf.org/html/rfc6901#page-3
+ * @param {string} s encoded segment
+ * @returns {string} decoded segment
+ */
+function decodeSegment(s) {
+	// See: http://tools.ietf.org/html/rfc6901#page-3
+	return s.replace(encodedSeparatorRx, separator).replace(encodedEscapeRx, escapeChar);
+}
+
+/**
+ * Encode a JSON Pointer path segment
+ * @see http://tools.ietf.org/html/rfc6901#page-3
+ * @param {string} s decoded segment
+ * @returns {string} encoded segment
+ */
+function encodeSegment(s) {
+	return s.replace(escapeRx, encodedEscape).replace(separatorRx, encodedSeparator);
+}
+
+var arrayIndexRx = /^(0|[1-9]\d*)$/;
+
+/**
+ * Return true if s is a valid JSON Pointer array index
+ * @param {String} s
+ * @returns {boolean}
+ */
+function isValidArrayIndex(s) {
+	return arrayIndexRx.test(s);
+}
+
+/**
+ * Safely parse a string into a number >= 0. Does not check for decimal numbers
+ * @param {string} s numeric string
+ * @returns {number} number >= 0
+ */
+function parseArrayIndex (s) {
+	if(isValidArrayIndex(s)) {
+		return +s;
+	}
+
+	throw new SyntaxError('invalid array index ' + s);
+}
+
+function findIndex (findContext, start, array, context) {
+	var index = start;
+
+	if(index < 0) {
+		throw new Error('array index out of bounds ' + index);
+	}
+
+	if(context !== void 0 && typeof findContext === 'function') {
+		index = findContext(start, array, context);
+		if(index < 0) {
+			throw new Error('could not find patch context ' + context);
+		}
+	}
+
+	return index;
+}
+},{"./jsonPointerParse":12}],12:[function(require,module,exports){
+/** @license MIT License (c) copyright 2010-2014 original author or authors */
+/** @author Brian Cavalier */
+/** @author John Hann */
+
+module.exports = jsonPointerParse;
+
+var parseRx = /\/|~1|~0/g;
+var separator = '/';
+var escapeChar = '~';
+var encodedSeparator = '~1';
+
+/**
+ * Parse through an encoded JSON Pointer string, decoding each path segment
+ * and passing it to an onSegment callback function.
+ * @see https://tools.ietf.org/html/rfc6901#section-4
+ * @param {string} path encoded JSON Pointer string
+ * @param {{function(segment:string):boolean}} onSegment callback function
+ * @returns {string} original path
+ */
+function jsonPointerParse(path, onSegment) {
+	var pos, accum, matches, match;
+
+	pos = path.charAt(0) === separator ? 1 : 0;
+	accum = '';
+	parseRx.lastIndex = pos;
+
+	while(matches = parseRx.exec(path)) {
+
+		match = matches[0];
+		accum += path.slice(pos, parseRx.lastIndex - match.length);
+		pos = parseRx.lastIndex;
+
+		if(match === separator) {
+			if (onSegment(accum) === false) return path;
+			accum = '';
+		} else {
+			accum += match === encodedSeparator ? separator : escapeChar;
+		}
+	}
+
+	accum += path.slice(pos);
+	onSegment(accum);
+
+	return path;
+}
+
+},{}],13:[function(require,module,exports){
+/** @license MIT License (c) copyright 2010-2014 original author or authors */
+/** @author Brian Cavalier */
+/** @author John Hann */
+
+exports.compare = compare;
+exports.reduce = reduce;
+
+var REMOVE, RIGHT, ADD, DOWN, SKIP;
+
+exports.REMOVE = REMOVE = RIGHT = -1;
+exports.ADD    = ADD    = DOWN  =  1;
+exports.EQUAL  = SKIP   = 0;
+
+/**
+ * Create an lcs comparison matrix describing the differences
+ * between two array-like sequences
+ * @param {array} a array-like
+ * @param {array} b array-like
+ * @returns {object} lcs descriptor, suitable for passing to reduce()
+ */
+function compare(a, b) {
+	var cols = a.length;
+	var rows = b.length;
+
+	var prefix = findPrefix(a, b);
+	var suffix = prefix < cols && prefix < rows
+		? findSuffix(a, b, prefix)
+		: 0;
+
+	var remove = suffix + prefix - 1;
+	cols -= remove;
+	rows -= remove;
+	var matrix = createMatrix(cols, rows);
+
+	for (var j = cols - 1; j >= 0; --j) {
+		for (var i = rows - 1; i >= 0; --i) {
+			matrix[i][j] = backtrack(matrix, a, b, prefix, j, i);
+		}
+	}
+
+	return {
+		prefix: prefix,
+		matrix: matrix,
+		suffix: suffix
+	};
+}
+
+/**
+ * Reduce a set of lcs changes previously created using compare
+ * @param {function(result:*, type:number, i:number, j:number)} f
+ *  reducer function, where:
+ *  - result is the current reduce value,
+ *  - type is the type of change: ADD, REMOVE, or SKIP
+ *  - i is the index of the change location in b
+ *  - j is the index of the change location in a
+ * @param {*} r initial value
+ * @param {object} lcs results returned by compare()
+ * @returns {*} the final reduced value
+ */
+function reduce(f, r, lcs) {
+	var i, j, k, op;
+
+	var m = lcs.matrix;
+
+	// Reduce shared prefix
+	var l = lcs.prefix;
+	for(i = 0;i < l; ++i) {
+		r = f(r, SKIP, i, i);
+	}
+
+	// Reduce longest change span
+	k = i;
+	l = m.length;
+	i = 0;
+	j = 0;
+	while(i < l) {
+		op = m[i][j].type;
+		r = f(r, op, i+k, j+k);
+
+		switch(op) {
+			case SKIP:  ++i; ++j; break;
+			case RIGHT: ++j; break;
+			case DOWN:  ++i; break;
+		}
+	}
+
+	// Reduce shared suffix
+	i += k;
+	j += k;
+	l = lcs.suffix;
+	for(k = 0;k < l; ++k) {
+		r = f(r, SKIP, i+k, j+k);
+	}
+
+	return r;
+}
+
+function findPrefix(a, b) {
+	var i = 0;
+	var l = Math.min(a.length, b.length);
+	while(i < l && a[i] === b[i]) {
+		++i;
+	}
+	return i;
+}
+
+function findSuffix(a, b) {
+	var al = a.length - 1;
+	var bl = b.length - 1;
+	var l = Math.min(al, bl);
+	var i = 0;
+	while(i < l && a[al-i] === b[bl-i]) {
+		++i;
+	}
+	return i;
+}
+
+function backtrack(matrix, a, b, start, j, i) {
+	if (a[j+start] === b[i+start]) {
+		return { value: matrix[i + 1][j + 1].value, type: SKIP };
+	}
+	if (matrix[i][j + 1].value < matrix[i + 1][j].value) {
+		return { value: matrix[i][j + 1].value + 1, type: RIGHT };
+	}
+
+	return { value: matrix[i + 1][j].value + 1, type: DOWN };
+}
+
+function createMatrix (cols, rows) {
+	var m = [], i, j, lastrow;
+
+	// Fill the last row
+	lastrow = m[rows] = [];
+	for (j = 0; j<cols; ++j) {
+		lastrow[j] = { value: cols - j, type: RIGHT };
+	}
+
+	// Fill the last col
+	for (i = 0; i<rows; ++i) {
+		m[i] = [];
+		m[i][cols] = { value: rows - i, type: DOWN };
+	}
+
+	// Fill the last cell
+	m[rows][cols] = { value: 0, type: SKIP };
+
+	return m;
+}
+
+},{}],14:[function(require,module,exports){
+var jsonPointer = require('./jsonPointer');
+var clone = require('./clone');
+var deepEquals = require('./deepEquals');
+var commutePaths = require('./commutePaths');
+
+var array = require('./array');
+
+var TestFailedError = require('./TestFailedError');
+var InvalidPatchOperationError = require('./InvalidPatchOperationError');
+var PatchNotInvertibleError = require('./PatchNotInvertibleError');
+
+var find = jsonPointer.find;
+var parseArrayIndex = jsonPointer.parseArrayIndex;
+
+exports.test = {
+	apply: applyTest,
+	inverse: invertTest,
+	commute: commuteTest
+};
+
+exports.add = {
+	apply: applyAdd,
+	inverse: invertAdd,
+	commute: commuteAddOrCopy
+};
+
+exports.remove = {
+	apply: applyRemove,
+	inverse: invertRemove,
+	commute: commuteRemove
+};
+
+exports.replace = {
+	apply: applyReplace,
+	inverse: invertReplace,
+	commute: commuteReplace
+};
+
+exports.move = {
+	apply: applyMove,
+	inverse: invertMove,
+	commute: commuteMove
+};
+
+exports.copy = {
+	apply: applyCopy,
+	inverse: notInvertible,
+	commute: commuteAddOrCopy
+};
+
+/**
+ * Apply a test operation to x
+ * @param {object|array} x
+ * @param {object} test test operation
+ * @throws {TestFailedError} if the test operation fails
+ */
+
+function applyTest(x, test, options) {
+	var pointer = find(x, test.path, options.findContext, test.context);
+	var target = pointer.target;
+	var index, value;
+
+	if(Array.isArray(target)) {
+		index = parseArrayIndex(pointer.key);
+		//index = findIndex(options.findContext, index, target, test.context);
+		value = target[index];
+	} else {
+		value = pointer.key === void 0 ? pointer.target : pointer.target[pointer.key];
+	}
+
+	if(!deepEquals(value, test.value)) {
+		throw new TestFailedError('test failed ' + JSON.stringify(test));
+	}
+
+	return x;
+}
+
+/**
+ * Invert the provided test and add it to the inverted patch sequence
+ * @param pr
+ * @param test
+ * @returns {number}
+ */
+function invertTest(pr, test) {
+	pr.push(test);
+	return 1;
+}
+
+function commuteTest(test, b) {
+	if(test.path === b.path && b.op === 'remove') {
+		throw new TypeError('Can\'t commute test,remove -> remove,test for same path');
+	}
+
+	if(b.op === 'test' || b.op === 'replace') {
+		return [b, test];
+	}
+
+	return commutePaths(test, b);
+}
+
+/**
+ * Apply an add operation to x
+ * @param {object|array} x
+ * @param {object} change add operation
+ */
+function applyAdd(x, change, options) {
+	var pointer = find(x, change.path, options.findContext, change.context);
+
+	if(notFound(pointer)) {
+		throw new InvalidPatchOperationError('path does not exist ' + change.path);
+	}
+
+	if(change.value === void 0) {
+		throw new InvalidPatchOperationError('missing value');
+	}
+
+	var val = clone(change.value);
+
+	// If pointer refers to whole document, replace whole document
+	if(pointer.key === void 0) {
+		return val;
+	}
+
+	_add(pointer, val);
+	return x;
+}
+
+function _add(pointer, value) {
+	var target = pointer.target;
+
+	if(Array.isArray(target)) {
+		// '-' indicates 'append' to array
+		if(pointer.key === '-') {
+			target.push(value);
+		} else if (pointer.key > target.length) {
+			throw new InvalidPatchOperationError('target of add outside of array bounds')
+		} else {
+			target.splice(pointer.key, 0, value);
+		}
+	} else if(isValidObject(target)) {
+		target[pointer.key] = value;
+	} else {
+		throw new InvalidPatchOperationError('target of add must be an object or array ' + pointer.key);
+	}
+}
+
+function invertAdd(pr, add) {
+	var context = add.context;
+	if(context !== void 0) {
+		context = {
+			before: context.before,
+			after: array.cons(add.value, context.after)
+		}
+	}
+	pr.push({ op: 'test', path: add.path, value: add.value, context: context });
+	pr.push({ op: 'remove', path: add.path, context: context });
+	return 1;
+}
+
+function commuteAddOrCopy(add, b) {
+	if(add.path === b.path && b.op === 'remove') {
+		throw new TypeError('Can\'t commute add,remove -> remove,add for same path');
+	}
+
+	return commutePaths(add, b);
+}
+
+/**
+ * Apply a replace operation to x
+ * @param {object|array} x
+ * @param {object} change replace operation
+ */
+function applyReplace(x, change, options) {
+	var pointer = find(x, change.path, options.findContext, change.context);
+
+	if(notFound(pointer) || missingValue(pointer)) {
+		throw new InvalidPatchOperationError('path does not exist ' + change.path);
+	}
+
+	if(change.value === void 0) {
+		throw new InvalidPatchOperationError('missing value');
+	}
+
+	var value = clone(change.value);
+
+	// If pointer refers to whole document, replace whole document
+	if(pointer.key === void 0) {
+		return value;
+	}
+
+	var target = pointer.target;
+
+	if(Array.isArray(target)) {
+		target[parseArrayIndex(pointer.key)] = value;
+	} else {
+		target[pointer.key] = value;
+	}
+
+	return x;
+}
+
+function invertReplace(pr, c, i, patch) {
+	var prev = patch[i-1];
+	if(prev === void 0 || prev.op !== 'test' || prev.path !== c.path) {
+		throw new PatchNotInvertibleError('cannot invert replace w/o test');
+	}
+
+	var context = prev.context;
+	if(context !== void 0) {
+		context = {
+			before: context.before,
+			after: array.cons(prev.value, array.tail(context.after))
+		}
+	}
+
+	pr.push({ op: 'test', path: prev.path, value: c.value });
+	pr.push({ op: 'replace', path: prev.path, value: prev.value });
+	return 2;
+}
+
+function commuteReplace(replace, b) {
+	if(replace.path === b.path && b.op === 'remove') {
+		throw new TypeError('Can\'t commute replace,remove -> remove,replace for same path');
+	}
+
+	if(b.op === 'test' || b.op === 'replace') {
+		return [b, replace];
+	}
+
+	return commutePaths(replace, b);
+}
+
+/**
+ * Apply a remove operation to x
+ * @param {object|array} x
+ * @param {object} change remove operation
+ */
+function applyRemove(x, change, options) {
+	var pointer = find(x, change.path, options.findContext, change.context);
+
+	// key must exist for remove
+	if(notFound(pointer) || pointer.target[pointer.key] === void 0) {
+		throw new InvalidPatchOperationError('path does not exist ' + change.path);
+	}
+
+	_remove(pointer);
+	return x;
+}
+
+function _remove (pointer) {
+	var target = pointer.target;
+
+	var removed;
+	if (Array.isArray(target)) {
+		removed = target.splice(parseArrayIndex(pointer.key), 1);
+		return removed[0];
+
+	} else if (isValidObject(target)) {
+		removed = target[pointer.key];
+		delete target[pointer.key];
+		return removed;
+
+	} else {
+		throw new InvalidPatchOperationError('target of remove must be an object or array');
+	}
+}
+
+function invertRemove(pr, c, i, patch) {
+	var prev = patch[i-1];
+	if(prev === void 0 || prev.op !== 'test' || prev.path !== c.path) {
+		throw new PatchNotInvertibleError('cannot invert remove w/o test');
+	}
+
+	var context = prev.context;
+	if(context !== void 0) {
+		context = {
+			before: context.before,
+			after: array.tail(context.after)
+		}
+	}
+
+	pr.push({ op: 'add', path: prev.path, value: prev.value, context: context });
+	return 2;
+}
+
+function commuteRemove(remove, b) {
+	if(remove.path === b.path && b.op === 'remove') {
+		return [b, remove];
+	}
+
+	return commutePaths(remove, b);
+}
+
+/**
+ * Apply a move operation to x
+ * @param {object|array} x
+ * @param {object} change move operation
+ */
+function applyMove(x, change, options) {
+	if(jsonPointer.contains(change.path, change.from)) {
+		throw new InvalidPatchOperationError('move.from cannot be ancestor of move.path');
+	}
+
+	var pto = find(x, change.path, options.findContext, change.context);
+	var pfrom = find(x, change.from, options.findContext, change.fromContext);
+
+	_add(pto, _remove(pfrom));
+	return x;
+}
+
+function invertMove(pr, c) {
+	pr.push({ op: 'move',
+		path: c.from, context: c.fromContext,
+		from: c.path, fromContext: c.context });
+	return 1;
+}
+
+function commuteMove(move, b) {
+	if(move.path === b.path && b.op === 'remove') {
+		throw new TypeError('Can\'t commute move,remove -> move,replace for same path');
+	}
+
+	return commutePaths(move, b);
+}
+
+/**
+ * Apply a copy operation to x
+ * @param {object|array} x
+ * @param {object} change copy operation
+ */
+function applyCopy(x, change, options) {
+	var pto = find(x, change.path, options.findContext, change.context);
+	var pfrom = find(x, change.from, options.findContext, change.fromContext);
+
+	if(notFound(pfrom) || missingValue(pfrom)) {
+		throw new InvalidPatchOperationError('copy.from must exist');
+	}
+
+	var target = pfrom.target;
+	var value;
+
+	if(Array.isArray(target)) {
+		value = target[parseArrayIndex(pfrom.key)];
+	} else {
+		value = target[pfrom.key];
+	}
+
+	_add(pto, clone(value));
+	return x;
+}
+
+// NOTE: Copy is not invertible
+// See https://github.com/cujojs/jiff/issues/9
+// This needs more thought. We may have to extend/amend JSON Patch.
+// At first glance, this seems like it should just be a remove.
+// However, that's not correct.  It violates the involution:
+// invert(invert(p)) ~= p.  For example:
+// invert(copy) -> remove
+// invert(remove) -> add
+// thus: invert(invert(copy)) -> add (DOH! this should be copy!)
+
+function notInvertible(_, c) {
+	throw new PatchNotInvertibleError('cannot invert ' + c.op);
+}
+
+function notFound (pointer) {
+	return pointer === void 0 || (pointer.target == null && pointer.key !== void 0);
+}
+
+function missingValue(pointer) {
+	return pointer.key !== void 0 && pointer.target[pointer.key] === void 0;
+}
+
+/**
+ * Return true if x is a non-null object
+ * @param {*} x
+ * @returns {boolean}
+ */
+function isValidObject (x) {
+	return x !== null && typeof x === 'object';
+}
+
+},{"./InvalidPatchOperationError":2,"./PatchNotInvertibleError":3,"./TestFailedError":4,"./array":5,"./clone":6,"./commutePaths":7,"./deepEquals":8,"./jsonPointer":11}],15:[function(require,module,exports){
 /*
 object-assign
 (c) Sindre Sorhus
@@ -90,7 +1548,7 @@ module.exports = shouldUseNative() ? Object.assign : function (target, source) {
 	return to;
 };
 
-},{}],2:[function(require,module,exports){
+},{}],16:[function(require,module,exports){
 // shim for using process in browser
 var process = module.exports = {};
 
@@ -276,7 +1734,7 @@ process.chdir = function (dir) {
 };
 process.umask = function() { return 0; };
 
-},{}],3:[function(require,module,exports){
+},{}],17:[function(require,module,exports){
 (function (process){
 /**
  * Copyright (c) 2013-present, Facebook, Inc.
@@ -382,7 +1840,691 @@ checkPropTypes.resetWarningCache = function() {
 module.exports = checkPropTypes;
 
 }).call(this,require('_process'))
-},{"./lib/ReactPropTypesSecret":4,"_process":2}],4:[function(require,module,exports){
+},{"./lib/ReactPropTypesSecret":21,"_process":16}],18:[function(require,module,exports){
+/**
+ * Copyright (c) 2013-present, Facebook, Inc.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+'use strict';
+
+var ReactPropTypesSecret = require('./lib/ReactPropTypesSecret');
+
+function emptyFunction() {}
+function emptyFunctionWithReset() {}
+emptyFunctionWithReset.resetWarningCache = emptyFunction;
+
+module.exports = function() {
+  function shim(props, propName, componentName, location, propFullName, secret) {
+    if (secret === ReactPropTypesSecret) {
+      // It is still safe when called from React.
+      return;
+    }
+    var err = new Error(
+      'Calling PropTypes validators directly is not supported by the `prop-types` package. ' +
+      'Use PropTypes.checkPropTypes() to call them. ' +
+      'Read more at http://fb.me/use-check-prop-types'
+    );
+    err.name = 'Invariant Violation';
+    throw err;
+  };
+  shim.isRequired = shim;
+  function getShim() {
+    return shim;
+  };
+  // Important!
+  // Keep this list in sync with production version in `./factoryWithTypeCheckers.js`.
+  var ReactPropTypes = {
+    array: shim,
+    bool: shim,
+    func: shim,
+    number: shim,
+    object: shim,
+    string: shim,
+    symbol: shim,
+
+    any: shim,
+    arrayOf: getShim,
+    element: shim,
+    elementType: shim,
+    instanceOf: getShim,
+    node: shim,
+    objectOf: getShim,
+    oneOf: getShim,
+    oneOfType: getShim,
+    shape: getShim,
+    exact: getShim,
+
+    checkPropTypes: emptyFunctionWithReset,
+    resetWarningCache: emptyFunction
+  };
+
+  ReactPropTypes.PropTypes = ReactPropTypes;
+
+  return ReactPropTypes;
+};
+
+},{"./lib/ReactPropTypesSecret":21}],19:[function(require,module,exports){
+(function (process){
+/**
+ * Copyright (c) 2013-present, Facebook, Inc.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+'use strict';
+
+var ReactIs = require('react-is');
+var assign = require('object-assign');
+
+var ReactPropTypesSecret = require('./lib/ReactPropTypesSecret');
+var checkPropTypes = require('./checkPropTypes');
+
+var has = Function.call.bind(Object.prototype.hasOwnProperty);
+var printWarning = function() {};
+
+if (process.env.NODE_ENV !== 'production') {
+  printWarning = function(text) {
+    var message = 'Warning: ' + text;
+    if (typeof console !== 'undefined') {
+      console.error(message);
+    }
+    try {
+      // --- Welcome to debugging React ---
+      // This error was thrown as a convenience so that you can use this stack
+      // to find the callsite that caused this warning to fire.
+      throw new Error(message);
+    } catch (x) {}
+  };
+}
+
+function emptyFunctionThatReturnsNull() {
+  return null;
+}
+
+module.exports = function(isValidElement, throwOnDirectAccess) {
+  /* global Symbol */
+  var ITERATOR_SYMBOL = typeof Symbol === 'function' && Symbol.iterator;
+  var FAUX_ITERATOR_SYMBOL = '@@iterator'; // Before Symbol spec.
+
+  /**
+   * Returns the iterator method function contained on the iterable object.
+   *
+   * Be sure to invoke the function with the iterable as context:
+   *
+   *     var iteratorFn = getIteratorFn(myIterable);
+   *     if (iteratorFn) {
+   *       var iterator = iteratorFn.call(myIterable);
+   *       ...
+   *     }
+   *
+   * @param {?object} maybeIterable
+   * @return {?function}
+   */
+  function getIteratorFn(maybeIterable) {
+    var iteratorFn = maybeIterable && (ITERATOR_SYMBOL && maybeIterable[ITERATOR_SYMBOL] || maybeIterable[FAUX_ITERATOR_SYMBOL]);
+    if (typeof iteratorFn === 'function') {
+      return iteratorFn;
+    }
+  }
+
+  /**
+   * Collection of methods that allow declaration and validation of props that are
+   * supplied to React components. Example usage:
+   *
+   *   var Props = require('ReactPropTypes');
+   *   var MyArticle = React.createClass({
+   *     propTypes: {
+   *       // An optional string prop named "description".
+   *       description: Props.string,
+   *
+   *       // A required enum prop named "category".
+   *       category: Props.oneOf(['News','Photos']).isRequired,
+   *
+   *       // A prop named "dialog" that requires an instance of Dialog.
+   *       dialog: Props.instanceOf(Dialog).isRequired
+   *     },
+   *     render: function() { ... }
+   *   });
+   *
+   * A more formal specification of how these methods are used:
+   *
+   *   type := array|bool|func|object|number|string|oneOf([...])|instanceOf(...)
+   *   decl := ReactPropTypes.{type}(.isRequired)?
+   *
+   * Each and every declaration produces a function with the same signature. This
+   * allows the creation of custom validation functions. For example:
+   *
+   *  var MyLink = React.createClass({
+   *    propTypes: {
+   *      // An optional string or URI prop named "href".
+   *      href: function(props, propName, componentName) {
+   *        var propValue = props[propName];
+   *        if (propValue != null && typeof propValue !== 'string' &&
+   *            !(propValue instanceof URI)) {
+   *          return new Error(
+   *            'Expected a string or an URI for ' + propName + ' in ' +
+   *            componentName
+   *          );
+   *        }
+   *      }
+   *    },
+   *    render: function() {...}
+   *  });
+   *
+   * @internal
+   */
+
+  var ANONYMOUS = '<<anonymous>>';
+
+  // Important!
+  // Keep this list in sync with production version in `./factoryWithThrowingShims.js`.
+  var ReactPropTypes = {
+    array: createPrimitiveTypeChecker('array'),
+    bool: createPrimitiveTypeChecker('boolean'),
+    func: createPrimitiveTypeChecker('function'),
+    number: createPrimitiveTypeChecker('number'),
+    object: createPrimitiveTypeChecker('object'),
+    string: createPrimitiveTypeChecker('string'),
+    symbol: createPrimitiveTypeChecker('symbol'),
+
+    any: createAnyTypeChecker(),
+    arrayOf: createArrayOfTypeChecker,
+    element: createElementTypeChecker(),
+    elementType: createElementTypeTypeChecker(),
+    instanceOf: createInstanceTypeChecker,
+    node: createNodeChecker(),
+    objectOf: createObjectOfTypeChecker,
+    oneOf: createEnumTypeChecker,
+    oneOfType: createUnionTypeChecker,
+    shape: createShapeTypeChecker,
+    exact: createStrictShapeTypeChecker,
+  };
+
+  /**
+   * inlined Object.is polyfill to avoid requiring consumers ship their own
+   * https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Object/is
+   */
+  /*eslint-disable no-self-compare*/
+  function is(x, y) {
+    // SameValue algorithm
+    if (x === y) {
+      // Steps 1-5, 7-10
+      // Steps 6.b-6.e: +0 != -0
+      return x !== 0 || 1 / x === 1 / y;
+    } else {
+      // Step 6.a: NaN == NaN
+      return x !== x && y !== y;
+    }
+  }
+  /*eslint-enable no-self-compare*/
+
+  /**
+   * We use an Error-like object for backward compatibility as people may call
+   * PropTypes directly and inspect their output. However, we don't use real
+   * Errors anymore. We don't inspect their stack anyway, and creating them
+   * is prohibitively expensive if they are created too often, such as what
+   * happens in oneOfType() for any type before the one that matched.
+   */
+  function PropTypeError(message) {
+    this.message = message;
+    this.stack = '';
+  }
+  // Make `instanceof Error` still work for returned errors.
+  PropTypeError.prototype = Error.prototype;
+
+  function createChainableTypeChecker(validate) {
+    if (process.env.NODE_ENV !== 'production') {
+      var manualPropTypeCallCache = {};
+      var manualPropTypeWarningCount = 0;
+    }
+    function checkType(isRequired, props, propName, componentName, location, propFullName, secret) {
+      componentName = componentName || ANONYMOUS;
+      propFullName = propFullName || propName;
+
+      if (secret !== ReactPropTypesSecret) {
+        if (throwOnDirectAccess) {
+          // New behavior only for users of `prop-types` package
+          var err = new Error(
+            'Calling PropTypes validators directly is not supported by the `prop-types` package. ' +
+            'Use `PropTypes.checkPropTypes()` to call them. ' +
+            'Read more at http://fb.me/use-check-prop-types'
+          );
+          err.name = 'Invariant Violation';
+          throw err;
+        } else if (process.env.NODE_ENV !== 'production' && typeof console !== 'undefined') {
+          // Old behavior for people using React.PropTypes
+          var cacheKey = componentName + ':' + propName;
+          if (
+            !manualPropTypeCallCache[cacheKey] &&
+            // Avoid spamming the console because they are often not actionable except for lib authors
+            manualPropTypeWarningCount < 3
+          ) {
+            printWarning(
+              'You are manually calling a React.PropTypes validation ' +
+              'function for the `' + propFullName + '` prop on `' + componentName  + '`. This is deprecated ' +
+              'and will throw in the standalone `prop-types` package. ' +
+              'You may be seeing this warning due to a third-party PropTypes ' +
+              'library. See https://fb.me/react-warning-dont-call-proptypes ' + 'for details.'
+            );
+            manualPropTypeCallCache[cacheKey] = true;
+            manualPropTypeWarningCount++;
+          }
+        }
+      }
+      if (props[propName] == null) {
+        if (isRequired) {
+          if (props[propName] === null) {
+            return new PropTypeError('The ' + location + ' `' + propFullName + '` is marked as required ' + ('in `' + componentName + '`, but its value is `null`.'));
+          }
+          return new PropTypeError('The ' + location + ' `' + propFullName + '` is marked as required in ' + ('`' + componentName + '`, but its value is `undefined`.'));
+        }
+        return null;
+      } else {
+        return validate(props, propName, componentName, location, propFullName);
+      }
+    }
+
+    var chainedCheckType = checkType.bind(null, false);
+    chainedCheckType.isRequired = checkType.bind(null, true);
+
+    return chainedCheckType;
+  }
+
+  function createPrimitiveTypeChecker(expectedType) {
+    function validate(props, propName, componentName, location, propFullName, secret) {
+      var propValue = props[propName];
+      var propType = getPropType(propValue);
+      if (propType !== expectedType) {
+        // `propValue` being instance of, say, date/regexp, pass the 'object'
+        // check, but we can offer a more precise error message here rather than
+        // 'of type `object`'.
+        var preciseType = getPreciseType(propValue);
+
+        return new PropTypeError('Invalid ' + location + ' `' + propFullName + '` of type ' + ('`' + preciseType + '` supplied to `' + componentName + '`, expected ') + ('`' + expectedType + '`.'));
+      }
+      return null;
+    }
+    return createChainableTypeChecker(validate);
+  }
+
+  function createAnyTypeChecker() {
+    return createChainableTypeChecker(emptyFunctionThatReturnsNull);
+  }
+
+  function createArrayOfTypeChecker(typeChecker) {
+    function validate(props, propName, componentName, location, propFullName) {
+      if (typeof typeChecker !== 'function') {
+        return new PropTypeError('Property `' + propFullName + '` of component `' + componentName + '` has invalid PropType notation inside arrayOf.');
+      }
+      var propValue = props[propName];
+      if (!Array.isArray(propValue)) {
+        var propType = getPropType(propValue);
+        return new PropTypeError('Invalid ' + location + ' `' + propFullName + '` of type ' + ('`' + propType + '` supplied to `' + componentName + '`, expected an array.'));
+      }
+      for (var i = 0; i < propValue.length; i++) {
+        var error = typeChecker(propValue, i, componentName, location, propFullName + '[' + i + ']', ReactPropTypesSecret);
+        if (error instanceof Error) {
+          return error;
+        }
+      }
+      return null;
+    }
+    return createChainableTypeChecker(validate);
+  }
+
+  function createElementTypeChecker() {
+    function validate(props, propName, componentName, location, propFullName) {
+      var propValue = props[propName];
+      if (!isValidElement(propValue)) {
+        var propType = getPropType(propValue);
+        return new PropTypeError('Invalid ' + location + ' `' + propFullName + '` of type ' + ('`' + propType + '` supplied to `' + componentName + '`, expected a single ReactElement.'));
+      }
+      return null;
+    }
+    return createChainableTypeChecker(validate);
+  }
+
+  function createElementTypeTypeChecker() {
+    function validate(props, propName, componentName, location, propFullName) {
+      var propValue = props[propName];
+      if (!ReactIs.isValidElementType(propValue)) {
+        var propType = getPropType(propValue);
+        return new PropTypeError('Invalid ' + location + ' `' + propFullName + '` of type ' + ('`' + propType + '` supplied to `' + componentName + '`, expected a single ReactElement type.'));
+      }
+      return null;
+    }
+    return createChainableTypeChecker(validate);
+  }
+
+  function createInstanceTypeChecker(expectedClass) {
+    function validate(props, propName, componentName, location, propFullName) {
+      if (!(props[propName] instanceof expectedClass)) {
+        var expectedClassName = expectedClass.name || ANONYMOUS;
+        var actualClassName = getClassName(props[propName]);
+        return new PropTypeError('Invalid ' + location + ' `' + propFullName + '` of type ' + ('`' + actualClassName + '` supplied to `' + componentName + '`, expected ') + ('instance of `' + expectedClassName + '`.'));
+      }
+      return null;
+    }
+    return createChainableTypeChecker(validate);
+  }
+
+  function createEnumTypeChecker(expectedValues) {
+    if (!Array.isArray(expectedValues)) {
+      if (process.env.NODE_ENV !== 'production') {
+        if (arguments.length > 1) {
+          printWarning(
+            'Invalid arguments supplied to oneOf, expected an array, got ' + arguments.length + ' arguments. ' +
+            'A common mistake is to write oneOf(x, y, z) instead of oneOf([x, y, z]).'
+          );
+        } else {
+          printWarning('Invalid argument supplied to oneOf, expected an array.');
+        }
+      }
+      return emptyFunctionThatReturnsNull;
+    }
+
+    function validate(props, propName, componentName, location, propFullName) {
+      var propValue = props[propName];
+      for (var i = 0; i < expectedValues.length; i++) {
+        if (is(propValue, expectedValues[i])) {
+          return null;
+        }
+      }
+
+      var valuesString = JSON.stringify(expectedValues, function replacer(key, value) {
+        var type = getPreciseType(value);
+        if (type === 'symbol') {
+          return String(value);
+        }
+        return value;
+      });
+      return new PropTypeError('Invalid ' + location + ' `' + propFullName + '` of value `' + String(propValue) + '` ' + ('supplied to `' + componentName + '`, expected one of ' + valuesString + '.'));
+    }
+    return createChainableTypeChecker(validate);
+  }
+
+  function createObjectOfTypeChecker(typeChecker) {
+    function validate(props, propName, componentName, location, propFullName) {
+      if (typeof typeChecker !== 'function') {
+        return new PropTypeError('Property `' + propFullName + '` of component `' + componentName + '` has invalid PropType notation inside objectOf.');
+      }
+      var propValue = props[propName];
+      var propType = getPropType(propValue);
+      if (propType !== 'object') {
+        return new PropTypeError('Invalid ' + location + ' `' + propFullName + '` of type ' + ('`' + propType + '` supplied to `' + componentName + '`, expected an object.'));
+      }
+      for (var key in propValue) {
+        if (has(propValue, key)) {
+          var error = typeChecker(propValue, key, componentName, location, propFullName + '.' + key, ReactPropTypesSecret);
+          if (error instanceof Error) {
+            return error;
+          }
+        }
+      }
+      return null;
+    }
+    return createChainableTypeChecker(validate);
+  }
+
+  function createUnionTypeChecker(arrayOfTypeCheckers) {
+    if (!Array.isArray(arrayOfTypeCheckers)) {
+      process.env.NODE_ENV !== 'production' ? printWarning('Invalid argument supplied to oneOfType, expected an instance of array.') : void 0;
+      return emptyFunctionThatReturnsNull;
+    }
+
+    for (var i = 0; i < arrayOfTypeCheckers.length; i++) {
+      var checker = arrayOfTypeCheckers[i];
+      if (typeof checker !== 'function') {
+        printWarning(
+          'Invalid argument supplied to oneOfType. Expected an array of check functions, but ' +
+          'received ' + getPostfixForTypeWarning(checker) + ' at index ' + i + '.'
+        );
+        return emptyFunctionThatReturnsNull;
+      }
+    }
+
+    function validate(props, propName, componentName, location, propFullName) {
+      for (var i = 0; i < arrayOfTypeCheckers.length; i++) {
+        var checker = arrayOfTypeCheckers[i];
+        if (checker(props, propName, componentName, location, propFullName, ReactPropTypesSecret) == null) {
+          return null;
+        }
+      }
+
+      return new PropTypeError('Invalid ' + location + ' `' + propFullName + '` supplied to ' + ('`' + componentName + '`.'));
+    }
+    return createChainableTypeChecker(validate);
+  }
+
+  function createNodeChecker() {
+    function validate(props, propName, componentName, location, propFullName) {
+      if (!isNode(props[propName])) {
+        return new PropTypeError('Invalid ' + location + ' `' + propFullName + '` supplied to ' + ('`' + componentName + '`, expected a ReactNode.'));
+      }
+      return null;
+    }
+    return createChainableTypeChecker(validate);
+  }
+
+  function createShapeTypeChecker(shapeTypes) {
+    function validate(props, propName, componentName, location, propFullName) {
+      var propValue = props[propName];
+      var propType = getPropType(propValue);
+      if (propType !== 'object') {
+        return new PropTypeError('Invalid ' + location + ' `' + propFullName + '` of type `' + propType + '` ' + ('supplied to `' + componentName + '`, expected `object`.'));
+      }
+      for (var key in shapeTypes) {
+        var checker = shapeTypes[key];
+        if (!checker) {
+          continue;
+        }
+        var error = checker(propValue, key, componentName, location, propFullName + '.' + key, ReactPropTypesSecret);
+        if (error) {
+          return error;
+        }
+      }
+      return null;
+    }
+    return createChainableTypeChecker(validate);
+  }
+
+  function createStrictShapeTypeChecker(shapeTypes) {
+    function validate(props, propName, componentName, location, propFullName) {
+      var propValue = props[propName];
+      var propType = getPropType(propValue);
+      if (propType !== 'object') {
+        return new PropTypeError('Invalid ' + location + ' `' + propFullName + '` of type `' + propType + '` ' + ('supplied to `' + componentName + '`, expected `object`.'));
+      }
+      // We need to check all keys in case some are required but missing from
+      // props.
+      var allKeys = assign({}, props[propName], shapeTypes);
+      for (var key in allKeys) {
+        var checker = shapeTypes[key];
+        if (!checker) {
+          return new PropTypeError(
+            'Invalid ' + location + ' `' + propFullName + '` key `' + key + '` supplied to `' + componentName + '`.' +
+            '\nBad object: ' + JSON.stringify(props[propName], null, '  ') +
+            '\nValid keys: ' +  JSON.stringify(Object.keys(shapeTypes), null, '  ')
+          );
+        }
+        var error = checker(propValue, key, componentName, location, propFullName + '.' + key, ReactPropTypesSecret);
+        if (error) {
+          return error;
+        }
+      }
+      return null;
+    }
+
+    return createChainableTypeChecker(validate);
+  }
+
+  function isNode(propValue) {
+    switch (typeof propValue) {
+      case 'number':
+      case 'string':
+      case 'undefined':
+        return true;
+      case 'boolean':
+        return !propValue;
+      case 'object':
+        if (Array.isArray(propValue)) {
+          return propValue.every(isNode);
+        }
+        if (propValue === null || isValidElement(propValue)) {
+          return true;
+        }
+
+        var iteratorFn = getIteratorFn(propValue);
+        if (iteratorFn) {
+          var iterator = iteratorFn.call(propValue);
+          var step;
+          if (iteratorFn !== propValue.entries) {
+            while (!(step = iterator.next()).done) {
+              if (!isNode(step.value)) {
+                return false;
+              }
+            }
+          } else {
+            // Iterator will provide entry [k,v] tuples rather than values.
+            while (!(step = iterator.next()).done) {
+              var entry = step.value;
+              if (entry) {
+                if (!isNode(entry[1])) {
+                  return false;
+                }
+              }
+            }
+          }
+        } else {
+          return false;
+        }
+
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  function isSymbol(propType, propValue) {
+    // Native Symbol.
+    if (propType === 'symbol') {
+      return true;
+    }
+
+    // falsy value can't be a Symbol
+    if (!propValue) {
+      return false;
+    }
+
+    // 19.4.3.5 Symbol.prototype[@@toStringTag] === 'Symbol'
+    if (propValue['@@toStringTag'] === 'Symbol') {
+      return true;
+    }
+
+    // Fallback for non-spec compliant Symbols which are polyfilled.
+    if (typeof Symbol === 'function' && propValue instanceof Symbol) {
+      return true;
+    }
+
+    return false;
+  }
+
+  // Equivalent of `typeof` but with special handling for array and regexp.
+  function getPropType(propValue) {
+    var propType = typeof propValue;
+    if (Array.isArray(propValue)) {
+      return 'array';
+    }
+    if (propValue instanceof RegExp) {
+      // Old webkits (at least until Android 4.0) return 'function' rather than
+      // 'object' for typeof a RegExp. We'll normalize this here so that /bla/
+      // passes PropTypes.object.
+      return 'object';
+    }
+    if (isSymbol(propType, propValue)) {
+      return 'symbol';
+    }
+    return propType;
+  }
+
+  // This handles more types than `getPropType`. Only used for error messages.
+  // See `createPrimitiveTypeChecker`.
+  function getPreciseType(propValue) {
+    if (typeof propValue === 'undefined' || propValue === null) {
+      return '' + propValue;
+    }
+    var propType = getPropType(propValue);
+    if (propType === 'object') {
+      if (propValue instanceof Date) {
+        return 'date';
+      } else if (propValue instanceof RegExp) {
+        return 'regexp';
+      }
+    }
+    return propType;
+  }
+
+  // Returns a string that is postfixed to a warning about an invalid type.
+  // For example, "undefined" or "of type array"
+  function getPostfixForTypeWarning(value) {
+    var type = getPreciseType(value);
+    switch (type) {
+      case 'array':
+      case 'object':
+        return 'an ' + type;
+      case 'boolean':
+      case 'date':
+      case 'regexp':
+        return 'a ' + type;
+      default:
+        return type;
+    }
+  }
+
+  // Returns class name of the object, if any.
+  function getClassName(propValue) {
+    if (!propValue.constructor || !propValue.constructor.name) {
+      return ANONYMOUS;
+    }
+    return propValue.constructor.name;
+  }
+
+  ReactPropTypes.checkPropTypes = checkPropTypes;
+  ReactPropTypes.resetWarningCache = checkPropTypes.resetWarningCache;
+  ReactPropTypes.PropTypes = ReactPropTypes;
+
+  return ReactPropTypes;
+};
+
+}).call(this,require('_process'))
+},{"./checkPropTypes":17,"./lib/ReactPropTypesSecret":21,"_process":16,"object-assign":15,"react-is":27}],20:[function(require,module,exports){
+(function (process){
+/**
+ * Copyright (c) 2013-present, Facebook, Inc.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+if (process.env.NODE_ENV !== 'production') {
+  var ReactIs = require('react-is');
+
+  // By explicitly using `prop-types` you are opting into new development behavior.
+  // http://fb.me/prop-types-in-prod
+  var throwOnDirectAccess = true;
+  module.exports = require('./factoryWithTypeCheckers')(ReactIs.isElement, throwOnDirectAccess);
+} else {
+  // By explicitly using `prop-types` you are opting into new production behavior.
+  // http://fb.me/prop-types-in-prod
+  module.exports = require('./factoryWithThrowingShims')();
+}
+
+}).call(this,require('_process'))
+},{"./factoryWithThrowingShims":18,"./factoryWithTypeCheckers":19,"_process":16,"react-is":27}],21:[function(require,module,exports){
 /**
  * Copyright (c) 2013-present, Facebook, Inc.
  *
@@ -396,7 +2538,7 @@ var ReactPropTypesSecret = 'SECRET_DO_NOT_PASS_THIS_OR_YOU_WILL_BE_FIRED';
 
 module.exports = ReactPropTypesSecret;
 
-},{}],5:[function(require,module,exports){
+},{}],22:[function(require,module,exports){
 (function (process){
 /** @license React v16.8.6
  * react-dom.development.js
@@ -21678,7 +23820,7 @@ module.exports = reactDom;
 }
 
 }).call(this,require('_process'))
-},{"_process":2,"object-assign":1,"prop-types/checkPropTypes":3,"react":10,"scheduler":15,"scheduler/tracing":16}],6:[function(require,module,exports){
+},{"_process":16,"object-assign":15,"prop-types/checkPropTypes":17,"react":30,"scheduler":35,"scheduler/tracing":36}],23:[function(require,module,exports){
 /** @license React v16.8.6
  * react-dom.production.min.js
  *
@@ -21949,7 +24091,7 @@ x("38"):void 0;return Si(a,b,c,!1,d)},unmountComponentAtNode:function(a){Qi(a)?v
 X;X=!0;try{ki(a)}finally{(X=b)||W||Yh(1073741823,!1)}},__SECRET_INTERNALS_DO_NOT_USE_OR_YOU_WILL_BE_FIRED:{Events:[Ia,Ja,Ka,Ba.injectEventPluginsByName,pa,Qa,function(a){ya(a,Pa)},Eb,Fb,Dd,Da]}};function Ui(a,b){Qi(a)?void 0:x("299","unstable_createRoot");return new Pi(a,!0,null!=b&&!0===b.hydrate)}
 (function(a){var b=a.findFiberByHostInstance;return Te(n({},a,{overrideProps:null,currentDispatcherRef:Tb.ReactCurrentDispatcher,findHostInstanceByFiber:function(a){a=hd(a);return null===a?null:a.stateNode},findFiberByHostInstance:function(a){return b?b(a):null}}))})({findFiberByHostInstance:Ha,bundleType:0,version:"16.8.6",rendererPackageName:"react-dom"});var Wi={default:Vi},Xi=Wi&&Vi||Wi;module.exports=Xi.default||Xi;
 
-},{"object-assign":1,"react":10,"scheduler":15}],7:[function(require,module,exports){
+},{"object-assign":15,"react":30,"scheduler":35}],24:[function(require,module,exports){
 (function (process){
 'use strict';
 
@@ -21991,7 +24133,266 @@ if (process.env.NODE_ENV === 'production') {
 }
 
 }).call(this,require('_process'))
-},{"./cjs/react-dom.development.js":5,"./cjs/react-dom.production.min.js":6,"_process":2}],8:[function(require,module,exports){
+},{"./cjs/react-dom.development.js":22,"./cjs/react-dom.production.min.js":23,"_process":16}],25:[function(require,module,exports){
+(function (process){
+/** @license React v16.8.6
+ * react-is.development.js
+ *
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+'use strict';
+
+
+
+if (process.env.NODE_ENV !== "production") {
+  (function() {
+'use strict';
+
+Object.defineProperty(exports, '__esModule', { value: true });
+
+// The Symbol used to tag the ReactElement-like types. If there is no native Symbol
+// nor polyfill, then a plain number is used for performance.
+var hasSymbol = typeof Symbol === 'function' && Symbol.for;
+
+var REACT_ELEMENT_TYPE = hasSymbol ? Symbol.for('react.element') : 0xeac7;
+var REACT_PORTAL_TYPE = hasSymbol ? Symbol.for('react.portal') : 0xeaca;
+var REACT_FRAGMENT_TYPE = hasSymbol ? Symbol.for('react.fragment') : 0xeacb;
+var REACT_STRICT_MODE_TYPE = hasSymbol ? Symbol.for('react.strict_mode') : 0xeacc;
+var REACT_PROFILER_TYPE = hasSymbol ? Symbol.for('react.profiler') : 0xead2;
+var REACT_PROVIDER_TYPE = hasSymbol ? Symbol.for('react.provider') : 0xeacd;
+var REACT_CONTEXT_TYPE = hasSymbol ? Symbol.for('react.context') : 0xeace;
+var REACT_ASYNC_MODE_TYPE = hasSymbol ? Symbol.for('react.async_mode') : 0xeacf;
+var REACT_CONCURRENT_MODE_TYPE = hasSymbol ? Symbol.for('react.concurrent_mode') : 0xeacf;
+var REACT_FORWARD_REF_TYPE = hasSymbol ? Symbol.for('react.forward_ref') : 0xead0;
+var REACT_SUSPENSE_TYPE = hasSymbol ? Symbol.for('react.suspense') : 0xead1;
+var REACT_MEMO_TYPE = hasSymbol ? Symbol.for('react.memo') : 0xead3;
+var REACT_LAZY_TYPE = hasSymbol ? Symbol.for('react.lazy') : 0xead4;
+
+function isValidElementType(type) {
+  return typeof type === 'string' || typeof type === 'function' ||
+  // Note: its typeof might be other than 'symbol' or 'number' if it's a polyfill.
+  type === REACT_FRAGMENT_TYPE || type === REACT_CONCURRENT_MODE_TYPE || type === REACT_PROFILER_TYPE || type === REACT_STRICT_MODE_TYPE || type === REACT_SUSPENSE_TYPE || typeof type === 'object' && type !== null && (type.$$typeof === REACT_LAZY_TYPE || type.$$typeof === REACT_MEMO_TYPE || type.$$typeof === REACT_PROVIDER_TYPE || type.$$typeof === REACT_CONTEXT_TYPE || type.$$typeof === REACT_FORWARD_REF_TYPE);
+}
+
+/**
+ * Forked from fbjs/warning:
+ * https://github.com/facebook/fbjs/blob/e66ba20ad5be433eb54423f2b097d829324d9de6/packages/fbjs/src/__forks__/warning.js
+ *
+ * Only change is we use console.warn instead of console.error,
+ * and do nothing when 'console' is not supported.
+ * This really simplifies the code.
+ * ---
+ * Similar to invariant but only logs a warning if the condition is not met.
+ * This can be used to log issues in development environments in critical
+ * paths. Removing the logging code for production environments will keep the
+ * same logic and follow the same code paths.
+ */
+
+var lowPriorityWarning = function () {};
+
+{
+  var printWarning = function (format) {
+    for (var _len = arguments.length, args = Array(_len > 1 ? _len - 1 : 0), _key = 1; _key < _len; _key++) {
+      args[_key - 1] = arguments[_key];
+    }
+
+    var argIndex = 0;
+    var message = 'Warning: ' + format.replace(/%s/g, function () {
+      return args[argIndex++];
+    });
+    if (typeof console !== 'undefined') {
+      console.warn(message);
+    }
+    try {
+      // --- Welcome to debugging React ---
+      // This error was thrown as a convenience so that you can use this stack
+      // to find the callsite that caused this warning to fire.
+      throw new Error(message);
+    } catch (x) {}
+  };
+
+  lowPriorityWarning = function (condition, format) {
+    if (format === undefined) {
+      throw new Error('`lowPriorityWarning(condition, format, ...args)` requires a warning ' + 'message argument');
+    }
+    if (!condition) {
+      for (var _len2 = arguments.length, args = Array(_len2 > 2 ? _len2 - 2 : 0), _key2 = 2; _key2 < _len2; _key2++) {
+        args[_key2 - 2] = arguments[_key2];
+      }
+
+      printWarning.apply(undefined, [format].concat(args));
+    }
+  };
+}
+
+var lowPriorityWarning$1 = lowPriorityWarning;
+
+function typeOf(object) {
+  if (typeof object === 'object' && object !== null) {
+    var $$typeof = object.$$typeof;
+    switch ($$typeof) {
+      case REACT_ELEMENT_TYPE:
+        var type = object.type;
+
+        switch (type) {
+          case REACT_ASYNC_MODE_TYPE:
+          case REACT_CONCURRENT_MODE_TYPE:
+          case REACT_FRAGMENT_TYPE:
+          case REACT_PROFILER_TYPE:
+          case REACT_STRICT_MODE_TYPE:
+          case REACT_SUSPENSE_TYPE:
+            return type;
+          default:
+            var $$typeofType = type && type.$$typeof;
+
+            switch ($$typeofType) {
+              case REACT_CONTEXT_TYPE:
+              case REACT_FORWARD_REF_TYPE:
+              case REACT_PROVIDER_TYPE:
+                return $$typeofType;
+              default:
+                return $$typeof;
+            }
+        }
+      case REACT_LAZY_TYPE:
+      case REACT_MEMO_TYPE:
+      case REACT_PORTAL_TYPE:
+        return $$typeof;
+    }
+  }
+
+  return undefined;
+}
+
+// AsyncMode is deprecated along with isAsyncMode
+var AsyncMode = REACT_ASYNC_MODE_TYPE;
+var ConcurrentMode = REACT_CONCURRENT_MODE_TYPE;
+var ContextConsumer = REACT_CONTEXT_TYPE;
+var ContextProvider = REACT_PROVIDER_TYPE;
+var Element = REACT_ELEMENT_TYPE;
+var ForwardRef = REACT_FORWARD_REF_TYPE;
+var Fragment = REACT_FRAGMENT_TYPE;
+var Lazy = REACT_LAZY_TYPE;
+var Memo = REACT_MEMO_TYPE;
+var Portal = REACT_PORTAL_TYPE;
+var Profiler = REACT_PROFILER_TYPE;
+var StrictMode = REACT_STRICT_MODE_TYPE;
+var Suspense = REACT_SUSPENSE_TYPE;
+
+var hasWarnedAboutDeprecatedIsAsyncMode = false;
+
+// AsyncMode should be deprecated
+function isAsyncMode(object) {
+  {
+    if (!hasWarnedAboutDeprecatedIsAsyncMode) {
+      hasWarnedAboutDeprecatedIsAsyncMode = true;
+      lowPriorityWarning$1(false, 'The ReactIs.isAsyncMode() alias has been deprecated, ' + 'and will be removed in React 17+. Update your code to use ' + 'ReactIs.isConcurrentMode() instead. It has the exact same API.');
+    }
+  }
+  return isConcurrentMode(object) || typeOf(object) === REACT_ASYNC_MODE_TYPE;
+}
+function isConcurrentMode(object) {
+  return typeOf(object) === REACT_CONCURRENT_MODE_TYPE;
+}
+function isContextConsumer(object) {
+  return typeOf(object) === REACT_CONTEXT_TYPE;
+}
+function isContextProvider(object) {
+  return typeOf(object) === REACT_PROVIDER_TYPE;
+}
+function isElement(object) {
+  return typeof object === 'object' && object !== null && object.$$typeof === REACT_ELEMENT_TYPE;
+}
+function isForwardRef(object) {
+  return typeOf(object) === REACT_FORWARD_REF_TYPE;
+}
+function isFragment(object) {
+  return typeOf(object) === REACT_FRAGMENT_TYPE;
+}
+function isLazy(object) {
+  return typeOf(object) === REACT_LAZY_TYPE;
+}
+function isMemo(object) {
+  return typeOf(object) === REACT_MEMO_TYPE;
+}
+function isPortal(object) {
+  return typeOf(object) === REACT_PORTAL_TYPE;
+}
+function isProfiler(object) {
+  return typeOf(object) === REACT_PROFILER_TYPE;
+}
+function isStrictMode(object) {
+  return typeOf(object) === REACT_STRICT_MODE_TYPE;
+}
+function isSuspense(object) {
+  return typeOf(object) === REACT_SUSPENSE_TYPE;
+}
+
+exports.typeOf = typeOf;
+exports.AsyncMode = AsyncMode;
+exports.ConcurrentMode = ConcurrentMode;
+exports.ContextConsumer = ContextConsumer;
+exports.ContextProvider = ContextProvider;
+exports.Element = Element;
+exports.ForwardRef = ForwardRef;
+exports.Fragment = Fragment;
+exports.Lazy = Lazy;
+exports.Memo = Memo;
+exports.Portal = Portal;
+exports.Profiler = Profiler;
+exports.StrictMode = StrictMode;
+exports.Suspense = Suspense;
+exports.isValidElementType = isValidElementType;
+exports.isAsyncMode = isAsyncMode;
+exports.isConcurrentMode = isConcurrentMode;
+exports.isContextConsumer = isContextConsumer;
+exports.isContextProvider = isContextProvider;
+exports.isElement = isElement;
+exports.isForwardRef = isForwardRef;
+exports.isFragment = isFragment;
+exports.isLazy = isLazy;
+exports.isMemo = isMemo;
+exports.isPortal = isPortal;
+exports.isProfiler = isProfiler;
+exports.isStrictMode = isStrictMode;
+exports.isSuspense = isSuspense;
+  })();
+}
+
+}).call(this,require('_process'))
+},{"_process":16}],26:[function(require,module,exports){
+/** @license React v16.8.6
+ * react-is.production.min.js
+ *
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+'use strict';Object.defineProperty(exports,"__esModule",{value:!0});
+var b="function"===typeof Symbol&&Symbol.for,c=b?Symbol.for("react.element"):60103,d=b?Symbol.for("react.portal"):60106,e=b?Symbol.for("react.fragment"):60107,f=b?Symbol.for("react.strict_mode"):60108,g=b?Symbol.for("react.profiler"):60114,h=b?Symbol.for("react.provider"):60109,k=b?Symbol.for("react.context"):60110,l=b?Symbol.for("react.async_mode"):60111,m=b?Symbol.for("react.concurrent_mode"):60111,n=b?Symbol.for("react.forward_ref"):60112,p=b?Symbol.for("react.suspense"):60113,q=b?Symbol.for("react.memo"):
+60115,r=b?Symbol.for("react.lazy"):60116;function t(a){if("object"===typeof a&&null!==a){var u=a.$$typeof;switch(u){case c:switch(a=a.type,a){case l:case m:case e:case g:case f:case p:return a;default:switch(a=a&&a.$$typeof,a){case k:case n:case h:return a;default:return u}}case r:case q:case d:return u}}}function v(a){return t(a)===m}exports.typeOf=t;exports.AsyncMode=l;exports.ConcurrentMode=m;exports.ContextConsumer=k;exports.ContextProvider=h;exports.Element=c;exports.ForwardRef=n;
+exports.Fragment=e;exports.Lazy=r;exports.Memo=q;exports.Portal=d;exports.Profiler=g;exports.StrictMode=f;exports.Suspense=p;exports.isValidElementType=function(a){return"string"===typeof a||"function"===typeof a||a===e||a===m||a===g||a===f||a===p||"object"===typeof a&&null!==a&&(a.$$typeof===r||a.$$typeof===q||a.$$typeof===h||a.$$typeof===k||a.$$typeof===n)};exports.isAsyncMode=function(a){return v(a)||t(a)===l};exports.isConcurrentMode=v;exports.isContextConsumer=function(a){return t(a)===k};
+exports.isContextProvider=function(a){return t(a)===h};exports.isElement=function(a){return"object"===typeof a&&null!==a&&a.$$typeof===c};exports.isForwardRef=function(a){return t(a)===n};exports.isFragment=function(a){return t(a)===e};exports.isLazy=function(a){return t(a)===r};exports.isMemo=function(a){return t(a)===q};exports.isPortal=function(a){return t(a)===d};exports.isProfiler=function(a){return t(a)===g};exports.isStrictMode=function(a){return t(a)===f};
+exports.isSuspense=function(a){return t(a)===p};
+
+},{}],27:[function(require,module,exports){
+(function (process){
+'use strict';
+
+if (process.env.NODE_ENV === 'production') {
+  module.exports = require('./cjs/react-is.production.min.js');
+} else {
+  module.exports = require('./cjs/react-is.development.js');
+}
+
+}).call(this,require('_process'))
+},{"./cjs/react-is.development.js":25,"./cjs/react-is.production.min.js":26,"_process":16}],28:[function(require,module,exports){
 (function (process){
 /** @license React v16.8.6
  * react.development.js
@@ -23896,7 +26297,7 @@ module.exports = react;
 }
 
 }).call(this,require('_process'))
-},{"_process":2,"object-assign":1,"prop-types/checkPropTypes":3}],9:[function(require,module,exports){
+},{"_process":16,"object-assign":15,"prop-types/checkPropTypes":17}],29:[function(require,module,exports){
 /** @license React v16.8.6
  * react.production.min.js
  *
@@ -23923,7 +26324,7 @@ b,d){return W().useImperativeHandle(a,b,d)},useDebugValue:function(){},useLayout
 b){void 0!==b.ref&&(h=b.ref,f=J.current);void 0!==b.key&&(g=""+b.key);var l=void 0;a.type&&a.type.defaultProps&&(l=a.type.defaultProps);for(c in b)K.call(b,c)&&!L.hasOwnProperty(c)&&(e[c]=void 0===b[c]&&void 0!==l?l[c]:b[c])}c=arguments.length-2;if(1===c)e.children=d;else if(1<c){l=Array(c);for(var m=0;m<c;m++)l[m]=arguments[m+2];e.children=l}return{$$typeof:p,type:a.type,key:g,ref:h,props:e,_owner:f}},createFactory:function(a){var b=M.bind(null,a);b.type=a;return b},isValidElement:N,version:"16.8.6",
 unstable_ConcurrentMode:x,unstable_Profiler:u,__SECRET_INTERNALS_DO_NOT_USE_OR_YOU_WILL_BE_FIRED:{ReactCurrentDispatcher:I,ReactCurrentOwner:J,assign:k}},Y={default:X},Z=Y&&X||Y;module.exports=Z.default||Z;
 
-},{"object-assign":1}],10:[function(require,module,exports){
+},{"object-assign":15}],30:[function(require,module,exports){
 (function (process){
 'use strict';
 
@@ -23934,7 +26335,7 @@ if (process.env.NODE_ENV === 'production') {
 }
 
 }).call(this,require('_process'))
-},{"./cjs/react.development.js":8,"./cjs/react.production.min.js":9,"_process":2}],11:[function(require,module,exports){
+},{"./cjs/react.development.js":28,"./cjs/react.production.min.js":29,"_process":16}],31:[function(require,module,exports){
 (function (process){
 /** @license React v0.13.6
  * scheduler-tracing.development.js
@@ -24361,7 +26762,7 @@ exports.unstable_unsubscribe = unstable_unsubscribe;
 }
 
 }).call(this,require('_process'))
-},{"_process":2}],12:[function(require,module,exports){
+},{"_process":16}],32:[function(require,module,exports){
 /** @license React v0.13.6
  * scheduler-tracing.production.min.js
  *
@@ -24373,7 +26774,7 @@ exports.unstable_unsubscribe = unstable_unsubscribe;
 
 'use strict';Object.defineProperty(exports,"__esModule",{value:!0});var b=0;exports.__interactionsRef=null;exports.__subscriberRef=null;exports.unstable_clear=function(a){return a()};exports.unstable_getCurrent=function(){return null};exports.unstable_getThreadID=function(){return++b};exports.unstable_trace=function(a,d,c){return c()};exports.unstable_wrap=function(a){return a};exports.unstable_subscribe=function(){};exports.unstable_unsubscribe=function(){};
 
-},{}],13:[function(require,module,exports){
+},{}],33:[function(require,module,exports){
 (function (process,global){
 /** @license React v0.13.6
  * scheduler.development.js
@@ -25076,7 +27477,7 @@ exports.unstable_getFirstCallbackNode = unstable_getFirstCallbackNode;
 }
 
 }).call(this,require('_process'),typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"_process":2}],14:[function(require,module,exports){
+},{"_process":16}],34:[function(require,module,exports){
 (function (global){
 /** @license React v0.13.6
  * scheduler.production.min.js
@@ -25101,7 +27502,7 @@ b=c.previous;b.next=c.previous=a;a.next=c;a.previous=b}return a};exports.unstabl
 exports.unstable_shouldYield=function(){return!e&&(null!==d&&d.expirationTime<l||w())};exports.unstable_continueExecution=function(){null!==d&&p()};exports.unstable_pauseExecution=function(){};exports.unstable_getFirstCallbackNode=function(){return d};
 
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{}],15:[function(require,module,exports){
+},{}],35:[function(require,module,exports){
 (function (process){
 'use strict';
 
@@ -25112,7 +27513,7 @@ if (process.env.NODE_ENV === 'production') {
 }
 
 }).call(this,require('_process'))
-},{"./cjs/scheduler.development.js":13,"./cjs/scheduler.production.min.js":14,"_process":2}],16:[function(require,module,exports){
+},{"./cjs/scheduler.development.js":33,"./cjs/scheduler.production.min.js":34,"_process":16}],36:[function(require,module,exports){
 (function (process){
 'use strict';
 
@@ -25123,7 +27524,7 @@ if (process.env.NODE_ENV === 'production') {
 }
 
 }).call(this,require('_process'))
-},{"./cjs/scheduler-tracing.development.js":11,"./cjs/scheduler-tracing.production.min.js":12,"_process":2}],17:[function(require,module,exports){
+},{"./cjs/scheduler-tracing.development.js":31,"./cjs/scheduler-tracing.production.min.js":32,"_process":16}],37:[function(require,module,exports){
 /**
  * vis.js
  * https://github.com/almende/vis
@@ -85060,7 +87461,7 @@ exports["default"] = FloydWarshall;
 /***/ })
 /******/ ]);
 });
-},{}],18:[function(require,module,exports){
+},{}],38:[function(require,module,exports){
 (function (process){
 'use strict';
 
@@ -85212,7 +87613,7 @@ function printSnapshotToConsole(snapshot) {
 };
 
 }).call(this,require('_process'))
-},{"./helpers/sanitize":19,"_process":2}],19:[function(require,module,exports){
+},{"./helpers/sanitize":39,"_process":16}],39:[function(require,module,exports){
 'use strict';
 
 Object.defineProperty(exports, "__esModule", {
@@ -85255,7 +87656,7 @@ function sanitize(something) {
   return result;
 }
 
-},{"./vendor/CircularJSON":20,"./vendor/SerializeError":21}],20:[function(require,module,exports){
+},{"./vendor/CircularJSON":40,"./vendor/SerializeError":41}],40:[function(require,module,exports){
 'use strict';
 
 Object.defineProperty(exports, "__esModule", {
@@ -85435,7 +87836,7 @@ exports.default = {
   parse: parseRecursion
 };
 
-},{}],21:[function(require,module,exports){
+},{}],41:[function(require,module,exports){
 /* eslint-disable */
 // Credits: https://github.com/sindresorhus/serialize-error
 
@@ -85520,7 +87921,7 @@ function destroyCircular(from, seen) {
 	return to;
 }
 
-},{}],22:[function(require,module,exports){
+},{}],42:[function(require,module,exports){
 'use strict';
 
 var _console = require('./console');
@@ -85536,7 +87937,7 @@ module.exports = {
     var snapshots = [];
 
     function snapshot(type, node) {
-      snapshots.push([type, { element: { id: node.element.id } }, processor.system().tree.diagnose()]);
+      snapshots.push([type, { element: { id: node.element.id, name: node.element.name } }, processor.system().tree.diagnose()]);
       (0, _console.printSnapshotToConsole)(snapshots[snapshots.length - 1]);
     }
 
@@ -85563,20 +87964,13 @@ module.exports = {
   }
 };
 
-},{"./console":18,"./ui/App":23}],23:[function(require,module,exports){
+},{"./console":38,"./ui/App":43}],43:[function(require,module,exports){
 'use strict';
 
 Object.defineProperty(exports, "__esModule", {
   value: true
 });
-
-var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
-
 exports.init = init;
-
-var _vis = require('vis');
-
-var _vis2 = _interopRequireDefault(_vis);
 
 var _react = require('react');
 
@@ -85586,22 +87980,89 @@ var _reactDom = require('react-dom');
 
 var _reactDom2 = _interopRequireDefault(_reactDom);
 
-var _styles = require('./styles');
+var _propTypes = require('prop-types');
+
+var _propTypes2 = _interopRequireDefault(_propTypes);
+
+var _constants = require('./constants');
 
 var _Navigation = require('./Navigation');
 
 var _Navigation2 = _interopRequireDefault(_Navigation);
 
+var _Graph = require('./Graph');
+
+var _Graph2 = _interopRequireDefault(_Graph);
+
 function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
 
-function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
+function AppComponent(_ref) {
+  var snapshots = _ref.snapshots;
 
-function _possibleConstructorReturn(self, call) { if (!self) { throw new ReferenceError("this hasn't been initialised - super() hasn't been called"); } return call && (typeof call === "object" || typeof call === "function") ? call : self; }
+  return _react2.default.createElement(
+    'div',
+    { className: 'actml-inspector', style: _constants.STYLE_INSPECTOR },
+    _react2.default.createElement(
+      _Navigation2.default,
+      { snapshots: snapshots },
+      function (snapshot) {
+        return _react2.default.createElement(_Graph2.default, { snapshot: snapshot });
+      }
+    )
+  );
+}
+AppComponent.propTypes = {
+  snapshots: _propTypes2.default.array
+};
 
-function _inherits(subClass, superClass) { if (typeof superClass !== "function" && superClass !== null) { throw new TypeError("Super expression must either be null or a function, not " + typeof superClass); } subClass.prototype = Object.create(superClass && superClass.prototype, { constructor: { value: subClass, enumerable: false, writable: true, configurable: true } }); if (superClass) Object.setPrototypeOf ? Object.setPrototypeOf(subClass, superClass) : subClass.__proto__ = superClass; } // https://visjs.org/docs/network/nodes.html
+function init(options) {
+  var snapshots = [];
 
+  _reactDom2.default.render(_react2.default.createElement(AppComponent, null), options.container);
+
+  return {
+    render: function render(snapshot) {
+      snapshots.push(snapshot);
+      _reactDom2.default.render(_react2.default.createElement(AppComponent, { snapshots: snapshots }), options.container);
+    }
+  };
+}
+
+},{"./Graph":44,"./Navigation":45,"./constants":46,"prop-types":20,"react":30,"react-dom":24}],44:[function(require,module,exports){
+'use strict';
+
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+
+var _slicedToArray = function () { function sliceIterator(arr, i) { var _arr = []; var _n = true; var _d = false; var _e = undefined; try { for (var _i = arr[Symbol.iterator](), _s; !(_n = (_s = _i.next()).done); _n = true) { _arr.push(_s.value); if (i && _arr.length === i) break; } } catch (err) { _d = true; _e = err; } finally { try { if (!_n && _i["return"]) _i["return"](); } finally { if (_d) throw _e; } } return _arr; } return function (arr, i) { if (Array.isArray(arr)) { return arr; } else if (Symbol.iterator in Object(arr)) { return sliceIterator(arr, i); } else { throw new TypeError("Invalid attempt to destructure non-iterable instance"); } }; }(); /* eslint-disable no-return-assign */
+// https://visjs.org/docs/network/nodes.html
+
+
+exports.default = Graph;
+
+var _vis = require('vis');
+
+var _vis2 = _interopRequireDefault(_vis);
+
+var _react = require('react');
+
+var _react2 = _interopRequireDefault(_react);
+
+var _propTypes = require('prop-types');
+
+var _propTypes2 = _interopRequireDefault(_propTypes);
+
+var _jiff = require('jiff');
+
+var _jiff2 = _interopRequireDefault(_jiff);
+
+var _constants = require('./constants');
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
 
 var GRAPH_DOM_ID = '__graph__';
+var network;
 
 var fillNodesAndEdges = function fillNodesAndEdges(snapshotNodes, graphNodes, graphEdges, groupId, parentId) {
   snapshotNodes.forEach(function (node) {
@@ -85621,81 +88082,88 @@ var fillNodesAndEdges = function fillNodesAndEdges(snapshotNodes, graphNodes, gr
     });
   });
 };
-
-var AppComponent = function (_React$Component) {
-  _inherits(AppComponent, _React$Component);
-
-  function AppComponent() {
-    _classCallCheck(this, AppComponent);
-
-    return _possibleConstructorReturn(this, (AppComponent.__proto__ || Object.getPrototypeOf(AppComponent)).apply(this, arguments));
+var getNetworkData = function getNetworkData(snapshot) {
+  if (!snapshot) {
+    return {
+      nodes: [],
+      edges: []
+    };
   }
+  var nodes = [];
+  var edges = [];
 
-  _createClass(AppComponent, [{
-    key: 'render',
-    value: function render() {
-      return _react2.default.createElement(
-        'div',
-        { className: 'actml-inspector', style: _styles.STYLE_INSPECTOR },
-        _react2.default.createElement(_Navigation2.default, null),
-        _react2.default.createElement('div', { id: GRAPH_DOM_ID })
-      );
-    }
-  }]);
+  fillNodesAndEdges([snapshot[2]], nodes, edges, 0);
 
-  return AppComponent;
-}(_react2.default.Component);
+  return { nodes: nodes, edges: edges };
+};
+var getNetwork = function getNetwork() {
+  if (network) return network;
 
-function init(options) {
-  var snapshots = [];
-
-  _reactDom2.default.render(_react2.default.createElement(AppComponent, null), options.container);
-
-  return {
-    render: function render(snapshot) {
-      snapshots.push(snapshot);
-
-      var tree = snapshot[2];
-      var nodes = [];
-      var edges = [];
-
-      fillNodesAndEdges([tree], nodes, edges, 0);
-
-      // create a network
-      var data = {
-        nodes: nodes,
-        edges: edges
-      };
-      var options = {
-        nodes: {
-          shape: 'dot',
-          size: 16,
-          font: {
-            size: 14,
-            color: '#000000',
-            strokeWidth: 10,
-            strokeColor: '#FFFFFF'
-          },
-          borderWidth: 2
-        },
-        edges: {
-          width: 2,
-          arrows: {
-            from: true
-          },
-          arrowStrikethrough: false
-        }
-      };
-      var network = new _vis2.default.Network(document.querySelector('#' + GRAPH_DOM_ID), data, options);
-
-      network.on('click', function (event) {
-        console.log(event);
-      });
-    }
+  var data = {
+    nodes: [],
+    edges: []
   };
-}
 
-},{"./Navigation":24,"./styles":25,"react":10,"react-dom":7,"vis":17}],24:[function(require,module,exports){
+  return network = new _vis2.default.Network(document.querySelector('#' + GRAPH_DOM_ID), data, _constants.graphOptions);
+};
+var getSnapshotElId = function getSnapshotElId(snapshot) {
+  if (snapshot) {
+    return snapshot[1].element.id;
+  }
+  return null;
+};
+var renderSnapshot = function renderSnapshot(currentSnapshot, newSnapshot) {
+  console.log(getSnapshotElId(currentSnapshot), getSnapshotElId(newSnapshot));
+  if (newSnapshot) {
+    var _network = getNetwork();
+    var currentData = getNetworkData(currentSnapshot);
+    var newData = getNetworkData(newSnapshot);
+    var patches = _jiff2.default.diff(currentData, newData);
+
+    var patchedData = patches.reduce(function (_ref, patch) {
+      var nodes = _ref.nodes,
+          edges = _ref.edges;
+
+      if (patch.op === 'add') {
+        if (patch.path.indexOf('/nodes') === 0) {
+          nodes.push(patch.value);
+        } else if (patch.path.indexOf('/edges') === 0) {
+          edges.push(patch.value);
+        } else {
+          console.warn('Unsupported path ' + patch.path);
+        }
+      } else {
+        console.warn('Unsupported patch operation ' + patch.op, patch);
+      }
+      return { nodes: nodes, edges: edges };
+    }, { nodes: [], edges: [] });
+
+    _network.setData(newData);
+
+    return newSnapshot;
+  }
+  return null;
+};
+
+function Graph(_ref2) {
+  var snapshot = _ref2.snapshot;
+
+  var _useState = (0, _react.useState)(),
+      _useState2 = _slicedToArray(_useState, 2),
+      lastRenderedSnapshot = _useState2[0],
+      setLastRenderedSnapshot = _useState2[1];
+
+  (0, _react.useEffect)(function () {
+    setLastRenderedSnapshot(renderSnapshot(lastRenderedSnapshot, snapshot));
+  }, [snapshot]);
+
+  return _react2.default.createElement('div', { id: GRAPH_DOM_ID });
+}
+Graph.propTypes = {
+  snapshot: _propTypes2.default.array
+};
+
+},{"./constants":46,"jiff":1,"prop-types":20,"react":30,"vis":37}],45:[function(require,module,exports){
 'use strict';
 
 Object.defineProperty(exports, "__esModule", {
@@ -85707,15 +88175,31 @@ var _react = require('react');
 
 var _react2 = _interopRequireDefault(_react);
 
-var _styles = require('./styles');
+var _propTypes = require('prop-types');
+
+var _propTypes2 = _interopRequireDefault(_propTypes);
+
+var _constants = require('./constants');
 
 function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
 
-function Navigation() {
-  return _react2.default.createElement('nav', { style: _styles.STYLES_NAV });
-}
+function Navigation(_ref) {
+  var snapshots = _ref.snapshots,
+      children = _ref.children;
 
-},{"./styles":25,"react":10}],25:[function(require,module,exports){
+  return _react2.default.createElement(
+    _react2.default.Fragment,
+    null,
+    _react2.default.createElement('nav', { style: _constants.STYLES_NAV }),
+    snapshots && snapshots.length > 0 ? children(snapshots[snapshots.length - 1]) : null
+  );
+}
+Navigation.propTypes = {
+  snapshots: _propTypes2.default.array,
+  children: _propTypes2.default.any
+};
+
+},{"./constants":46,"prop-types":20,"react":30}],46:[function(require,module,exports){
 'use strict';
 
 Object.defineProperty(exports, "__esModule", {
@@ -85730,6 +88214,71 @@ var STYLES_NAV = exports.STYLES_NAV = {
   background: '#f0f0f0',
   borderBottom: 'solid 1px #999'
 };
+var graphOptions = exports.graphOptions = {
+  nodes: {
+    shape: 'dot',
+    size: 16,
+    font: {
+      size: 14,
+      color: '#000000',
+      strokeWidth: 10,
+      strokeColor: '#FFFFFF'
+    },
+    borderWidth: 2
+  },
+  edges: {
+    width: 2,
+    arrows: {
+      from: true
+    },
+    arrowStrikethrough: false
+  },
+  physics: {
+    enabled: true,
+    barnesHut: {
+      gravitationalConstant: -2000,
+      centralGravity: 0.3,
+      springLength: 95,
+      springConstant: 0.04,
+      damping: 0.09,
+      avoidOverlap: 0
+    },
+    forceAtlas2Based: {
+      gravitationalConstant: -50,
+      centralGravity: 0.01,
+      springConstant: 0.08,
+      springLength: 100,
+      damping: 0.4,
+      avoidOverlap: 0
+    },
+    repulsion: {
+      centralGravity: 0.2,
+      springLength: 200,
+      springConstant: 0.05,
+      nodeDistance: 100,
+      damping: 0.09
+    },
+    hierarchicalRepulsion: {
+      centralGravity: 0.0,
+      springLength: 100,
+      springConstant: 0.01,
+      nodeDistance: 120,
+      damping: 0.09
+    },
+    maxVelocity: 50,
+    minVelocity: 0.1,
+    solver: 'barnesHut',
+    stabilization: {
+      enabled: true,
+      iterations: 1000,
+      updateInterval: 100,
+      onlyDynamicEdges: false,
+      fit: true
+    },
+    timestep: 0.5,
+    adaptiveTimestep: true
+  }
+};
 
-},{}]},{},[22])(22)
+},{}]},{},[42])(42)
 });

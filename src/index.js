@@ -12,7 +12,7 @@ module.exports = {
     function snapshot(type, node) {
       snapshots.push([
         type,
-        { element: { id: node.element.id }},
+        { element: { id: node.element.id, name: node.element.name }},
         processor.system().tree.diagnose()
       ]);
       printSnapshotToConsole(snapshots[snapshots.length - 1]);

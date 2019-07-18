@@ -1,9 +1,17 @@
-import React from 'react';
+import React, { useState } from 'react';
+import PropTypes from 'prop-types';
 
-import { STYLES_NAV } from './styles';
+import { STYLES_NAV } from './constants';
 
-export default function Navigation() {
+export default function Navigation({ snapshots, children }) {
   return (
-    <nav style={ STYLES_NAV }></nav>
+    <React.Fragment>
+      <nav style={ STYLES_NAV }></nav>
+      { snapshots && snapshots.length > 0 ? children(snapshots[snapshots.length - 1]) : null }
+    </React.Fragment>
   );
 }
+Navigation.propTypes = {
+  snapshots: PropTypes.array,
+  children: PropTypes.any
+};

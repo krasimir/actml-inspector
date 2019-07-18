@@ -17,15 +17,6 @@
     #container {
       height: 100%;
     }
-    .wrapper {
-      height: 100%;
-      display: grid;
-      grid-template-rows: 40px 1fr;
-    }
-    #nav {
-      background: #f0f0f0;
-      border-bottom: solid 1px #999;
-    }
   </style>
 </head>
 <body>
@@ -39,10 +30,10 @@
         container: document.querySelector('#container')
       });
 
-      snapshots.forEach((snapshot, i) => {
+      [ snapshots[0], snapshots[1], snapshots[2] ].forEach((snapshot, i) => {
         setTimeout(() => {
           actmlInspector.render(snapshot);
-        }, i * 1);
+        }, i * 2000);
       });
     }
   </script>
