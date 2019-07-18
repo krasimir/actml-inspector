@@ -88071,6 +88071,7 @@ var fillNodesAndEdges = function fillNodesAndEdges(snapshotNodes, graphNodes, gr
     }
     if (typeof parentId !== 'undefined') {
       graphEdges.push({
+        id: node.id + '_' + parentId,
         from: node.id,
         to: parentId
       });
@@ -88098,55 +88099,61 @@ var getNetworkData = function getNetworkData(snapshot) {
 };
 var getNetwork = function getNetwork() {
   if (network) return network;
-
-  var data = {
+  return network = new _vis2.default.Network(document.querySelector('#' + GRAPH_DOM_ID), {
     nodes: [],
     edges: []
-  };
-
-  return network = new _vis2.default.Network(document.querySelector('#' + GRAPH_DOM_ID), data, _constants.graphOptions);
-};
-var getSnapshotElId = function getSnapshotElId(snapshot) {
-  if (snapshot) {
-    return snapshot[1].element.id;
-  }
-  return null;
+  }, _constants.graphOptions);
 };
 var renderSnapshot = function renderSnapshot(currentSnapshot, newSnapshot) {
-  console.log(getSnapshotElId(currentSnapshot), getSnapshotElId(newSnapshot));
   if (newSnapshot) {
     var _network = getNetwork();
     var currentData = getNetworkData(currentSnapshot);
     var newData = getNetworkData(newSnapshot);
     var patches = _jiff2.default.diff(currentData, newData);
 
-    var patchedData = patches.reduce(function (_ref, patch) {
-      var nodes = _ref.nodes,
-          edges = _ref.edges;
+    console.log('%c' + JSON.stringify(currentData, null, 2), 'color: #B0B0B0');
+    console.log('%c' + JSON.stringify(newData, null, 2), 'color: #00009f');
+    console.log('%c' + JSON.stringify(patches, null, 2), 'color: red');
 
+    patches.forEach(function (patch) {
+      // ------------------------------------------------------------------ add
       if (patch.op === 'add') {
         if (patch.path.indexOf('/nodes') === 0) {
-          nodes.push(patch.value);
+          _network.body.data.nodes.add(patch.value);
         } else if (patch.path.indexOf('/edges') === 0) {
-          edges.push(patch.value);
+          _network.body.data.edges.add(patch.value);
         } else {
-          console.warn('Unsupported path ' + patch.path);
+          console.warn('add: unsupported path ' + patch.path);
         }
+        // ------------------------------------------------------------------ test
+      } else if (patch.op === 'test') {
+        // noop
+        // ------------------------------------------------------------------ remove
+      } else if (patch.op === 'remove') {
+        if (patch.path.indexOf('/nodes') === 0) {
+          var nodeArrIndex = Number(patch.path.replace('/nodes/', ''));
+
+          _network.body.data.nodes.remove(currentData.nodes[nodeArrIndex].id);
+        } else if (patch.path.indexOf('/edges') === 0) {
+          var edgeArrIndex = Number(patch.path.replace('/edges/', ''));
+
+          _network.body.data.nodes.remove(currentData.edges[edgeArrIndex].id);
+        } else {
+          console.warn('remove: unsupported path ' + patch.path);
+        }
+        // ------------------------------------------------------------------ not supported
       } else {
         console.warn('Unsupported patch operation ' + patch.op, patch);
       }
-      return { nodes: nodes, edges: edges };
-    }, { nodes: [], edges: [] });
-
-    _network.setData(newData);
+    });
 
     return newSnapshot;
   }
   return null;
 };
 
-function Graph(_ref2) {
-  var snapshot = _ref2.snapshot;
+function Graph(_ref) {
+  var snapshot = _ref.snapshot;
 
   var _useState = (0, _react.useState)(),
       _useState2 = _slicedToArray(_useState, 2),
@@ -88169,6 +88176,9 @@ Graph.propTypes = {
 Object.defineProperty(exports, "__esModule", {
   value: true
 });
+
+var _slicedToArray = function () { function sliceIterator(arr, i) { var _arr = []; var _n = true; var _d = false; var _e = undefined; try { for (var _i = arr[Symbol.iterator](), _s; !(_n = (_s = _i.next()).done); _n = true) { _arr.push(_s.value); if (i && _arr.length === i) break; } } catch (err) { _d = true; _e = err; } finally { try { if (!_n && _i["return"]) _i["return"](); } finally { if (_d) throw _e; } } return _arr; } return function (arr, i) { if (Array.isArray(arr)) { return arr; } else if (Symbol.iterator in Object(arr)) { return sliceIterator(arr, i); } else { throw new TypeError("Invalid attempt to destructure non-iterable instance"); } }; }();
+
 exports.default = Navigation;
 
 var _react = require('react');
@@ -88183,15 +88193,39 @@ var _constants = require('./constants');
 
 function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
 
+var getId = function getId(snapshot) {
+  return snapshot[1].element.id;
+};
+
 function Navigation(_ref) {
   var snapshots = _ref.snapshots,
       children = _ref.children;
 
+  var _useState = (0, _react.useState)(null),
+      _useState2 = _slicedToArray(_useState, 2),
+      current = _useState2[0],
+      setCurrent = _useState2[1];
+
+  var latest = snapshots && snapshots.length > 0 ? snapshots[snapshots.length - 1] : null;
+  var snapshotToRender = current ? current : latest;
+
   return _react2.default.createElement(
     _react2.default.Fragment,
     null,
-    _react2.default.createElement('nav', { style: _constants.STYLES_NAV }),
-    snapshots && snapshots.length > 0 ? children(snapshots[snapshots.length - 1]) : null
+    _react2.default.createElement(
+      'nav',
+      { style: _constants.STYLES_NAV },
+      snapshots && snapshots.map(function (snapshot) {
+        return _react2.default.createElement(
+          'button',
+          { key: getId(snapshot), onClick: function onClick() {
+              return setCurrent(snapshot);
+            } },
+          getId(snapshot)
+        );
+      })
+    ),
+    snapshotToRender && children(snapshotToRender)
   );
 }
 Navigation.propTypes = {

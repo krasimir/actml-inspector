@@ -16,6 +16,7 @@ const fillNodesAndEdges = function (snapshotNodes, graphNodes, graphEdges, group
     }
     if (typeof parentId !== 'undefined') {
       graphEdges.push({
+        id: `${ node.id }_${ parentId }`,
         from: node.id,
         to: parentId
       });
@@ -43,44 +44,57 @@ const getNetworkData = snapshot => {
 };
 const getNetwork = function () {
   if (network) return network;
-
-  let data = {
-    nodes: [],
-    edges: []
-  };
-
-  return network = new vis.Network(document.querySelector(`#${ GRAPH_DOM_ID }`), data, graphOptions);
-};
-const getSnapshotElId = snapshot => {
-  if (snapshot) {
-    return snapshot[1].element.id;
-  }
-  return null;
+  return network = new vis.Network(
+    document.querySelector(`#${ GRAPH_DOM_ID }`),
+    {
+      nodes: [],
+      edges: []
+    },
+    graphOptions
+  );
 };
 const renderSnapshot = function (currentSnapshot, newSnapshot) {
-  console.log(getSnapshotElId(currentSnapshot), getSnapshotElId(newSnapshot));
   if (newSnapshot) {
     const network = getNetwork();
     const currentData = getNetworkData(currentSnapshot);
     const newData = getNetworkData(newSnapshot);
     const patches = jiff.diff(currentData, newData);
 
-    const patchedData = patches.reduce(({ nodes, edges }, patch) => {
+    console.log('%c' + JSON.stringify(currentData, null, 2), 'color: #B0B0B0');
+    console.log('%c' + JSON.stringify(newData, null, 2), 'color: #00009f');
+    console.log('%c' + JSON.stringify(patches, null, 2), 'color: red');
+
+    patches.forEach((patch) => {
+      // ------------------------------------------------------------------ add
       if (patch.op === 'add') {
         if (patch.path.indexOf('/nodes') === 0) {
-          nodes.push(patch.value);
+          network.body.data.nodes.add(patch.value);
         } else if (patch.path.indexOf('/edges') === 0) {
-          edges.push(patch.value);
+          network.body.data.edges.add(patch.value);
         } else {
-          console.warn('Unsupported path ' + patch.path);
+          console.warn('add: unsupported path ' + patch.path);
         }
+      // ------------------------------------------------------------------ test
+      } else if (patch.op === 'test') {
+        // noop
+      // ------------------------------------------------------------------ remove
+      } else if (patch.op === 'remove') {
+        if (patch.path.indexOf('/nodes') === 0) {
+          const nodeArrIndex = Number(patch.path.replace('/nodes/', ''));
+
+          network.body.data.nodes.remove(currentData.nodes[nodeArrIndex].id);
+        } else if (patch.path.indexOf('/edges') === 0) {
+          const edgeArrIndex = Number(patch.path.replace('/edges/', ''));
+
+          network.body.data.nodes.remove(currentData.edges[edgeArrIndex].id);
+        } else {
+          console.warn('remove: unsupported path ' + patch.path);
+        }
+      // ------------------------------------------------------------------ not supported
       } else {
         console.warn('Unsupported patch operation ' + patch.op, patch);
       }
-      return { nodes, edges };
-    }, { nodes: [], edges: [] });
-
-    network.setData(newData);
+    });
 
     return newSnapshot;
   }

@@ -30,10 +30,10 @@
         container: document.querySelector('#container')
       });
 
-      [ snapshots[0], snapshots[1], snapshots[2] ].forEach((snapshot, i) => {
+      [ snapshots[0], snapshots[1] ].forEach((snapshot, i) => {
         setTimeout(() => {
           actmlInspector.render(snapshot);
-        }, i * 2000);
+        }, i * 1000);
       });
     }
   </script>
