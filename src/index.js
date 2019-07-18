@@ -1,11 +1,9 @@
-/* eslint-disable */
-
-const IN = 'IN';
 const OUT = 'OUT';
 const REMOVE = 'REMOVE';
+const IN = 'IN';
 
 import { printSnapshotToConsole } from './console';
-import { render } from './ui/Renderer';
+import { init } from './ui/App';
 
 module.exports = {
   watchToConsole(processor) {
@@ -27,5 +25,16 @@ module.exports = {
   printSnapshotToConsole(snapshots) {
     snapshots.forEach(printSnapshotToConsole);
   },
-  render
+  render(snapshot) {
+    if (!this.app) {
+      throw new Error('You must call `actmlInspector.init` first.');
+    }
+    this.app.render(snapshot);
+  },
+  init(options) {
+    if (!options || !options.container) {
+      throw new Error('`init` expects an options object with a `container` (DOM element) field in it.');
+    }
+    this.app = init(options);
+  }
 };
